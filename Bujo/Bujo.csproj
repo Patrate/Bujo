@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- net9.0 minimum : Guid.CreateVersion7() (UUIDv7) est natif depuis .NET 9 -->
+    <TargetFramework>net9.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <!-- WinForms uniquement pour Screen.AllScreens (énumération des moniteurs) -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <RootNamespace>Bujo</RootNamespace>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)' == 'Debug' ">
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <PropertyGroup Condition=" '$(Configuration)' == 'Release' ">
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="9.0.0" />
+    <PackageReference Include="SSH.NET" Version="2024.2.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="Data\schema.sql" LogicalName="Bujo.Data.schema.sql" />
+    <EmbeddedResource Include="Data\migrations\002_typed_habits.sql" LogicalName="Bujo.Data.migrations.002_typed_habits.sql" />
+    <EmbeddedResource Include="Data\migrations\003_habit_archive.sql" LogicalName="Bujo.Data.migrations.003_habit_archive.sql" />
+    <EmbeddedResource Include="Data\migrations\004_drop_unit_target.sql" LogicalName="Bujo.Data.migrations.004_drop_unit_target.sql" />
+  </ItemGroup>
+
+</Project>
