@@ -50,6 +50,18 @@ public static class Stats
         return new StreakInfo(current, best, inWindow, windowDays);
     }
 
+    /// <summary>
+    /// Série de la routine elle-même, à partir des jours où elle a été validée.
+    ///
+    /// Réutilise Compute plutôt que de refaire le calcul, et hérite donc de sa
+    /// nuance essentielle ici : le jour courant non encore validé ne rompt pas la
+    /// série. C'est exactement le cas du verrou, affiché le matin avant la routine —
+    /// il annoncerait sinon zéro chaque jour, ce qui serait à la fois faux et
+    /// décourageant.
+    /// </summary>
+    public static StreakInfo ComputeRoutine(IReadOnlyList<DateOnly> completedDays, DateOnly today, int windowDays) =>
+        Compute(completedDays.Select(d => new HabitDay(d, true, null)).ToList(), today, windowDays);
+
     /// <summary>Valeurs numériques non nulles, dans l'ordre chronologique.</summary>
     public static IReadOnlyList<(DateOnly Day, double Value)> NumberSeries(IReadOnlyList<HabitDay> history) =>
         history.Where(h => h.Number is not null)

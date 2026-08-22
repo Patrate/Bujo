@@ -1,4 +1,3 @@
-using System.IO;
 using System.Windows;
 using Bujo.Core;
 using Bujo.Lock;
@@ -33,9 +32,7 @@ public static class Program
         catch (Exception ex)
         {
             // Règle de sûreté : base illisible, on n'enferme personne.
-            File.AppendAllText(
-                Path.Combine(Path.GetTempPath(), "bujo-error.log"),
-                $"{DateTimeOffset.Now:O} {ex}\n");
+            Log.Write("startup", ex);
             return 1;
         }
 
@@ -70,10 +67,31 @@ public static class Program
     /// <summary>
     /// L'app reste résidente après le verrou : c'est elle qui surveille la bascule
     /// de 6 h tant que la session est ouverte.
+    ///
+    /// Le message dépend de la raison. Féliciter après une sortie de secours était
+    /// à la fois faux et un peu insultant ; à l'inverse, réprimander pousse à
+    /// l'abandon ou au contournement malhonnête. Le ton reste donc neutre et
+    /// rappelle simplement que la journée n'est pas jouée.
     /// </summary>
-    private static void OnLockReleased()
+    private static void OnLockReleased(LockRelease reason)
     {
-        _tray?.Notify("Routine validée", "Bonne journée. Bujo reste dans la zone de notification.");
+        switch (reason)
+        {
+            case LockRelease.Completed:
+                _tray?.Notify("Routine validée",
+                    "Bonne journée. Bujo reste dans la zone de notification.");
+                break;
+
+            case LockRelease.Bypassed:
+                _tray?.Notify("Verrou levé",
+                    "La routine du jour reste ouverte : tu peux la terminer depuis l'onglet Journal.");
+                break;
+
+            // Bascule du jour : la fenêtre de la veille se ferme pour laisser place
+            // à celle du jour. Rien n'a été fait, il n'y a rien à annoncer.
+            case LockRelease.DayChanged:
+                break;
+        }
     }
 
     private static void ShowMain()

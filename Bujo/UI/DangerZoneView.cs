@@ -45,16 +45,10 @@ public sealed class DangerZoneView : StackPanel
             Margin = new Thickness(0, 26, 0, 10)
         });
 
-        Children.Add(Row(
-            "Réinitialiser le compteur de sorties forcées",
-            "Efface les sorties forcées du journal du verrou. Les séries d'habitudes ne sont pas touchées.",
-            "Réinitialiser",
-            () => Confirm(
-                "Réinitialiser le compteur de sorties forcées ?",
-                "Les sorties forcées enregistrées seront définitivement effacées.\n\n"
-                + "Une copie de sûreté locale est créée avant l'opération.",
-                () => { _db.ResetBypassCounter(); return "Compteur réinitialisé."; })));
-
+        // La réinitialisation du compteur de sorties forcées a été retirée : le
+        // compteur lui-même disparaît de l'affichage en V1.1. Les lock_events
+        // continuent d'être enregistrés, JournalDb.ResetBypassCounter reste
+        // disponible si un outil de mode développeur en a besoin.
         Children.Add(Row(
             "Supprimer l'historique",
             "Efface les jours, les entrées de journal, les valeurs d'habitudes et les événements du verrou. "

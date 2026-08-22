@@ -9,6 +9,7 @@ public sealed record LogEntry(
     string Content,
     LogState State,
     DateOnly? MigratedTo,
+    string? MigratedFrom,
     int Position);
 
 public sealed record DayInfo(int? Mood, string? Note, bool RoutineCompleted);
@@ -22,7 +23,7 @@ public sealed partial class JournalDb
         var list = new List<LogEntry>();
         using var cmd = Connection.CreateCommand();
         cmd.CommandText = """
-            SELECT id, kind, content, state, migrated_to, position
+            SELECT id, kind, content, state, migrated_to, position, migrated_from
             FROM log_entries
             WHERE logical_date = $d AND deleted_at IS NULL
             ORDER BY position, created_at;
@@ -38,12 +39,21 @@ public sealed partial class JournalDb
                 Content: r.GetString(2),
                 State: ParseState(r.GetString(3)),
                 MigratedTo: r.IsDBNull(4) ? null : DateOnly.Parse(r.GetString(4)),
+                MigratedFrom: r.IsDBNull(6) ? null : r.GetString(6),
                 Position: r.GetInt32(5)));
         }
         return list;
     }
 
-    public string AddLogEntry(DateOnly day, LogKind kind, string content)
+    /// <summary>
+    /// Ajoute une entrée au daily log.
+    /// </summary>
+    /// <param name="migratedFrom">
+    /// ID de l'entrée mère quand cette entrée naît d'une migration. Écrit dans le
+    /// même INSERT que le reste : une entrée fille ne doit jamais exister, même
+    /// une milliseconde, sans le maillon qui la relie à sa mère.
+    /// </param>
+    public string AddLogEntry(DateOnly day, LogKind kind, string content, string? migratedFrom = null)
     {
         EnsureDay(day);
         var position = Convert.ToInt32(TryScalar(
@@ -53,12 +63,13 @@ public sealed partial class JournalDb
         var id = Clock.NewId();
         Exec("""
              INSERT INTO log_entries (id, logical_date, kind, content, state, position,
-                                      created_at, updated_at, device_id)
-             VALUES ($id, $d, $kind, $content, 'open', $pos, $t, $t, $dev);
+                                      migrated_from, created_at, updated_at, device_id)
+             VALUES ($id, $d, $kind, $content, 'open', $pos, $from, $t, $t, $dev);
              """,
             null,
             ("$id", id), ("$d", LogicalDay.Key(day)), ("$kind", KindKey(kind)),
             ("$content", content), ("$pos", position),
+            ("$from", (object?)migratedFrom ?? DBNull.Value),
             ("$t", Clock.Stamp()), ("$dev", DeviceId));
         return id;
     }
@@ -67,6 +78,12 @@ public sealed partial class JournalDb
         Exec("UPDATE log_entries SET content = $c, updated_at = $t, device_id = $dev WHERE id = $id;",
             null, ("$id", entryId), ("$c", content), ("$t", Clock.Stamp()), ("$dev", DeviceId));
 
+    /// <summary>
+    /// Changement d'état. migrated_to est remis à NULL parce qu'il décrit une
+    /// destination, qui n'a plus de sens hors de l'état « migrée ».
+    /// migrated_from n'est PAS touché : il décrit l'origine de cette entrée-ci,
+    /// un fait de naissance, vrai quel que soit son état ultérieur.
+    /// </summary>
     public void SetLogState(string entryId, LogState state) =>
         Exec("""
              UPDATE log_entries SET state = $s, migrated_to = NULL,
@@ -79,13 +96,17 @@ public sealed partial class JournalDb
     /// Migration au sens BuJo : l'entrée d'origine reste en place, marquée « migrée »
     /// vers sa destination, et une copie ouverte apparaît au jour cible. On garde ainsi
     /// la trace des reports, ce qui est tout l'intérêt de la revue mensuelle.
+    ///
+    /// Les deux sens sont écrits : migrated_to sur la mère (une date, pour l'affichage)
+    /// et migrated_from sur la fille (un ID, pour remonter la chaîne). Sans le second,
+    /// deux tâches repoussées le même jour vers le même jour seraient indiscernables.
     /// </summary>
     public string MigrateLogEntry(string entryId, DateOnly target)
     {
         var source = FindEntry(entryId)
             ?? throw new InvalidOperationException($"Entrée introuvable : {entryId}");
 
-        var copyId = AddLogEntry(target, source.Kind, source.Content);
+        var copyId = AddLogEntry(target, source.Kind, source.Content, migratedFrom: entryId);
 
         Exec("""
              UPDATE log_entries SET state = 'migrated', migrated_to = $target,
@@ -99,10 +120,78 @@ public sealed partial class JournalDb
         return copyId;
     }
 
-    /// <summary>Suppression logique : jamais de DELETE, sinon la synchro ressuscite la ligne.</summary>
-    public void DeleteLogEntry(string entryId) =>
-        Exec("UPDATE log_entries SET deleted_at = $t, updated_at = $t, device_id = $dev WHERE id = $id;",
-            null, ("$id", entryId), ("$t", Clock.Stamp()), ("$dev", DeviceId));
+    /// <summary>
+    /// Chaîne de reports en amont de cette entrée, de la feuille vers la racine.
+    /// L'entrée elle-même en est toujours le premier élément ; une entrée jamais
+    /// migrée donne donc une liste d'un seul élément.
+    ///
+    /// La remontée s'arrête dès qu'une mère manque, a été supprimée, ou n'est plus
+    /// en état « migrée » : sa trace de report n'a alors plus rien à décrire.
+    /// </summary>
+    public IReadOnlyList<string> GetMigrationChain(string entryId)
+    {
+        var link = ReadLink(entryId);
+        if (link is null) return [];
+
+        var chain = new List<string> { entryId };
+        // Garde-fou contre un cycle : impossible via l'interface, mais la synchro
+        // future pourra rapatrier des lignes écrites par un autre appareil.
+        var seen = new HashSet<string> { entryId };
+
+        var parentId = link.MigratedFrom;
+        while (parentId is not null && seen.Add(parentId))
+        {
+            var parent = ReadLink(parentId);
+            if (parent is null || parent.Deleted || parent.State != StateKey(LogState.Migrated)) break;
+
+            chain.Add(parentId);
+            parentId = parent.MigratedFrom;
+        }
+        return chain;
+    }
+
+    /// <summary>
+    /// Suppression logique de toute la chaîne de reports : jamais de DELETE, sinon
+    /// la synchro ressuscite la ligne.
+    ///
+    /// Une entrée déjà migrée n'expose aucun outil dans le journal : la suppression
+    /// entre donc toujours par la feuille, et il n'y a jamais de descente à faire.
+    /// Le geste efface l'histoire entière parce qu'une tâche qui n'aurait jamais dû
+    /// exister n'a pas d'histoire à raconter — c'est ce qui le distingue de
+    /// l'abandon, qui conserve la chaîne au complet.
+    /// </summary>
+    public void DeleteLogEntry(string entryId)
+    {
+        var chain = GetMigrationChain(entryId);
+        if (chain.Count == 0) return;
+
+        // Un seul horodatage pour toute la chaîne : les maillons ont été effacés
+        // par le même geste, et un futur « annuler » aura besoin de les reconnaître.
+        var stamp = Clock.Stamp();
+
+        using var tx = Connection.BeginTransaction();
+        foreach (var id in chain)
+            Exec("UPDATE log_entries SET deleted_at = $t, updated_at = $t, device_id = $dev WHERE id = $id;",
+                tx, ("$id", id), ("$t", stamp), ("$dev", DeviceId));
+        tx.Commit();
+    }
+
+    /// <summary>Le strict nécessaire à la remontée de chaîne, sans passer par LogEntry.</summary>
+    private sealed record ChainLink(string? MigratedFrom, string State, bool Deleted);
+
+    private ChainLink? ReadLink(string entryId)
+    {
+        using var cmd = Connection.CreateCommand();
+        cmd.CommandText = "SELECT migrated_from, state, deleted_at FROM log_entries WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", entryId);
+
+        using var r = cmd.ExecuteReader();
+        if (!r.Read()) return null;
+        return new ChainLink(
+            MigratedFrom: r.IsDBNull(0) ? null : r.GetString(0),
+            State: r.GetString(1),
+            Deleted: !r.IsDBNull(2));
+    }
 
     public void ReorderLog(IEnumerable<string> orderedIds)
     {
@@ -116,16 +205,23 @@ public sealed partial class JournalDb
     {
         using var cmd = Connection.CreateCommand();
         cmd.CommandText = """
-            SELECT id, kind, content, state, migrated_to, position
+            SELECT id, kind, content, state, migrated_to, position, migrated_from
             FROM log_entries WHERE id = $id;
             """;
         cmd.Parameters.AddWithValue("$id", entryId);
 
         using var r = cmd.ExecuteReader();
         if (!r.Read()) return null;
+        // Arguments nommés : l'appel positionnel précédent aurait changé de sens en
+        // silence à l'ajout d'un champ au record, les types coïncidant.
         return new LogEntry(
-            r.GetString(0), ParseKind(r.GetString(1)), r.GetString(2), ParseState(r.GetString(3)),
-            r.IsDBNull(4) ? null : DateOnly.Parse(r.GetString(4)), r.GetInt32(5));
+            Id: r.GetString(0),
+            Kind: ParseKind(r.GetString(1)),
+            Content: r.GetString(2),
+            State: ParseState(r.GetString(3)),
+            MigratedTo: r.IsDBNull(4) ? null : DateOnly.Parse(r.GetString(4)),
+            MigratedFrom: r.IsDBNull(6) ? null : r.GetString(6),
+            Position: r.GetInt32(5));
     }
     
     /// <summary>

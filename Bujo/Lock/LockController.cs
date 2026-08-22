@@ -6,6 +6,22 @@ using Forms = System.Windows.Forms;
 namespace Bujo.Lock;
 
 /// <summary>
+/// Raison de la levée du verrou. Les trois cas se ressemblent côté code — la même
+/// fenêtre se ferme — mais ne se ressemblent pas du tout côté utilisatrice.
+/// </summary>
+public enum LockRelease
+{
+    /// <summary>Toutes les lignes cochées, sortie par le bouton vert.</summary>
+    Completed,
+
+    /// <summary>Sortie de secours, après cinq secondes de maintien.</summary>
+    Bypassed,
+
+    /// <summary>Bascule du jour logique : la fenêtre affichait la veille.</summary>
+    DayChanged
+}
+
+/// <summary>
 /// Orchestre le verrou. Le contrat est simple : le verrou n'existe que tant que
 /// <see cref="JournalDb.IsRoutineDone"/> répond false pour le jour logique courant.
 /// </summary>
@@ -19,8 +35,12 @@ public sealed class LockController : IDisposable
     private DateOnly _day;
     private bool _active;
 
-    /// <summary>Levé quand la routine est validée ou qu'une sortie forcée a lieu.</summary>
-    public event Action? Released;
+    /// <summary>
+    /// Levé à chaque fermeture du verrou, avec la raison. Sans elle, l'appelant ne
+    /// peut pas distinguer une routine faite d'une fuite, et finit par féliciter
+    /// les deux.
+    /// </summary>
+    public event Action<LockRelease>? Released;
     public bool IsActive => _active;
 
     public LockController(JournalDb db)
@@ -61,8 +81,8 @@ public sealed class LockController : IDisposable
             var window = new LockWindow(
                 _db, _day, screen,
                 interactive: screen.Equals(primary),
-                onRoutineComplete: Release,
-                onBypass: Release);
+                onRoutineComplete: () => Release(LockRelease.Completed),
+                onBypass: () => Release(LockRelease.Bypassed));
             _windows.Add(window);
             window.Show();
         }
@@ -71,7 +91,7 @@ public sealed class LockController : IDisposable
         _windows.FirstOrDefault()?.Reassert();
     }
 
-    public void Release()
+    public void Release(LockRelease reason)
     {
         if (!_active) return;
         _active = false;
@@ -79,7 +99,7 @@ public sealed class LockController : IDisposable
 
         foreach (var w in _windows) w.AllowCloseAndClose();
         _windows.Clear();
-        Released?.Invoke();
+        Released?.Invoke(reason);
     }
 
     private void ReassertIfNeeded()
@@ -104,7 +124,7 @@ public sealed class LockController : IDisposable
         if (today == _day) return;
 
         _day = today;
-        if (_active) Release();          // la fenêtre affichait la veille
+        if (_active) Release(LockRelease.DayChanged);   // la fenêtre affichait la veille
         if (ShouldLock(_day)) Engage();
     }
 

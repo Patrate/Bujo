@@ -1,4 +1,5 @@
 using System.Drawing;
+using Bujo.Core;
 using Forms = System.Windows.Forms;
 
 namespace Bujo.Ui;
@@ -10,6 +11,13 @@ namespace Bujo.Ui;
 public sealed class TrayIcon : IDisposable
 {
     private readonly Forms.NotifyIcon _icon;
+
+    /// <summary>
+    /// Icône extraite de l'exe, dont nous sommes propriétaires. NotifyIcon ne libère
+    /// pas l'icône qu'on lui donne. Reste null si l'extraction a échoué : SystemIcons
+    /// rend une instance partagée par tout le processus, la libérer casserait le reste.
+    /// </summary>
+    private readonly Icon? _ownedIcon;
 
     public TrayIcon(Action open, Action lockNow, Action quit, Func<bool> isLocked)
     {
@@ -35,16 +43,42 @@ public sealed class TrayIcon : IDisposable
             lockItem.Enabled = !locked;
         };
 
+        _ownedIcon = TryExtractExeIcon();
+
         _icon = new Forms.NotifyIcon
         {
-            // TODO : remplacer par une vraie icône embarquée (Resources\bujo.ico).
-            Icon = SystemIcons.Application,
+            Icon = _ownedIcon ?? SystemIcons.Application,
             Text = "Bujo",
             Visible = true,
             ContextMenuStrip = menu
         };
 
         _icon.DoubleClick += (_, _) => { if (!isLocked()) open(); };
+    }
+
+    /// <summary>
+    /// Réutilise l'icône de l'exécutable, celle que déclare ApplicationIcon dans le
+    /// csproj : aucun fichier embarqué en double, et la zone de notification montre
+    /// exactement ce que montre la barre des tâches.
+    ///
+    /// Retourne null si l'extraction échoue, auquel cas l'appelant retombe sur
+    /// l'icône système. Une icône manquante ne doit pas empêcher l'application de
+    /// démarrer : sans zone de notification, une app sans fenêtre est perdue.
+    /// </summary>
+    private static Icon? TryExtractExeIcon()
+    {
+        try
+        {
+            var exe = Environment.ProcessPath;
+            // ExtractAssociatedIcon lève si le chemin est vide ou introuvable, et
+            // rend null si le fichier ne porte pas d'icône.
+            return exe is null ? null : Icon.ExtractAssociatedIcon(exe);
+        }
+        catch (Exception ex)
+        {
+            Log.Write("tray", ex);
+            return null;
+        }
     }
 
     public void Notify(string title, string message) =>
@@ -55,5 +89,7 @@ public sealed class TrayIcon : IDisposable
     {
         _icon.Visible = false;
         _icon.Dispose();
+        // Après le NotifyIcon, jamais avant : il tient encore le handle.
+        _ownedIcon?.Dispose();
     }
 }

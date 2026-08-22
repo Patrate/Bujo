@@ -1,12 +1,20 @@
+using System.Diagnostics;
+using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 using Bujo.Core;
 using Brushes = System.Windows.Media.Brushes;
+using Button = System.Windows.Controls.Button;
 using CheckBox = System.Windows.Controls.CheckBox;
 using ComboBox = System.Windows.Controls.ComboBox;
+using Cursors = System.Windows.Input.Cursors;
 using HAlign = System.Windows.HorizontalAlignment;
-using TextBox = System.Windows.Controls.TextBox;
+using Orientation = System.Windows.Controls.Orientation;
+// System.Windows.Shapes n'est pas importé ici, mais l'alias coûte moins cher que
+// le jour où quelqu'un ajoutera un tracé dans cette vue et cassera Path.
+using Path = System.IO.Path;
 using VAlign = System.Windows.VerticalAlignment;
 
 namespace Bujo.Ui;
@@ -15,8 +23,18 @@ namespace Bujo.Ui;
 public sealed class SettingsView : ScrollViewer
 {
     private readonly Settings _settings;
+    private readonly TextBlock _dayState = new();
+    private readonly TextBlock _exportState = new();
     private bool _loading = true;
+
     public event Action? DataChanged;
+
+    /// <summary>
+    /// Levé quand le décalage du jour logique change. Distinct de DataChanged : ce
+    /// n'est pas une relecture des mêmes données, c'est une entrée dans un autre
+    /// jour, et les vues doivent suivre — d'où Activate côté MainWindow.
+    /// </summary>
+    public event Action? DayOffsetChanged;
     
     public SettingsView(Settings settings, JournalDb db, BackupService backupService)
     {
@@ -72,20 +90,155 @@ public sealed class SettingsView : ScrollViewer
 
         stack.Children.Add(Section("Sauvegarde"));
 
-        var vps = new TextBox
-        {
-            Text = _settings.VpsUrl,
-            Width = 300,
-            Padding = new Thickness(6, 4, 6, 4)
-        };
-        vps.LostFocus += (_, _) => { if (!_loading) _settings.VpsUrl = vps.Text.Trim(); };
         stack.Children.Add(new BackupSettingsView(db, settings, backupService));
-        
+
+        stack.Children.Add(Section("Export"));
+
+        var exportButtons = new StackPanel { Orientation = Orientation.Horizontal };
+        exportButtons.Children.Add(SmallButton("Exporter en CSV", () => RunExport(db)));
+        exportButtons.Children.Add(SmallButton("Ouvrir le dossier", OpenExportFolder));
+        stack.Children.Add(Field(
+            "Habitudes et jours",
+            "Écrit deux fichiers dans %APPDATA%\\Bujo\\exports : une ligne par valeur d'habitude, "
+            + "une ligne par jour. Séparateur point-virgule et UTF-8 avec BOM, pour qu'Excel les "
+            + "ouvre directement. Les lignes supprimées et les habitudes archivées sont incluses, "
+            + "avec leurs dates, pour que l'export ne mente pas sur les trous de l'historique.",
+            exportButtons));
+
+        _exportState.FontSize = 12;
+        _exportState.Foreground = MainWindow.Muted;
+        _exportState.TextWrapping = TextWrapping.Wrap;
+        _exportState.Margin = new Thickness(0, -8, 0, 20);
+        stack.Children.Add(_exportState);
+
+        stack.Children.Add(Section("Avancé"));
+
+        // Tous les outils de mise au point vivent dans le même conteneur : une seule
+        // visibilité à basculer, et rien qui puisse rester affiché par oubli.
+        var devTools = new StackPanel
+        {
+            Visibility = _settings.DeveloperMode ? Visibility.Visible : Visibility.Collapsed
+        };
+
+        var developerMode = new CheckBox
+        {
+            IsChecked = _settings.DeveloperMode,
+            Foreground = Brushes.White,
+            FontSize = 14
+        };
+        developerMode.Checked += (_, _) => SetDeveloperMode(true, devTools);
+        developerMode.Unchecked += (_, _) => SetDeveloperMode(false, devTools);
+        stack.Children.Add(Field(
+            "Mode développeur",
+            "Découvre les outils de mise au point. À laisser désactivé en usage courant.",
+            developerMode));
+
+        // ------------------------------------------- décalage du jour logique
+
+        var dayButtons = new StackPanel { Orientation = Orientation.Horizontal };
+        dayButtons.Children.Add(SmallButton("− 1 jour", () => ShiftDay(-1)));
+        dayButtons.Children.Add(SmallButton("+ 1 jour", () => ShiftDay(+1)));
+        dayButtons.Children.Add(SmallButton("Réinitialiser", () => ShiftDay(null)));
+        devTools.Children.Add(Field(
+            "Décalage du jour logique",
+            "Fait croire à l'application qu'on est un autre jour, pour vérifier le retour du verrou "
+            + "sans attendre. Le verrou réagit dans les 30 secondes, comme à 6 h du matin. "
+            + "Non enregistré : un redémarrage remet le décalage à zéro.",
+            dayButtons));
+
+        _dayState.FontSize = 12;
+        _dayState.Foreground = MainWindow.Muted;
+        _dayState.Margin = new Thickness(0, -8, 0, 20);
+        devTools.Children.Add(_dayState);
+        RefreshDayState();
+
         var dangerZone = new DangerZoneView(db);
         dangerZone.DataChanged += () => DataChanged?.Invoke();
-        stack.Children.Add(dangerZone);
-        
+        devTools.Children.Add(dangerZone);
+
+        stack.Children.Add(devTools);
+
         _loading = false;
+    }
+
+    /// <summary>
+    /// Visibilité basculée à chaud plutôt que reconstruction de la vue : cocher la
+    /// case doit découvrir les outils sans redémarrage. Collapsed et non Hidden,
+    /// sinon ils laisseraient un trou dans la pile.
+    /// </summary>
+    private void SetDeveloperMode(bool enabled, UIElement devTools)
+    {
+        if (_loading) return;
+        _settings.DeveloperMode = enabled;
+        devTools.Visibility = enabled ? Visibility.Visible : Visibility.Collapsed;
+    }
+
+    /// <summary>
+    /// Export synchrone : sur un journal personnel, deux requêtes ordonnées et
+    /// quelques milliers de lignes ne gèlent pas l'interface de façon perceptible.
+    /// Si le fichier devenait lourd un jour, c'est ici qu'un Task.Run irait.
+    /// </summary>
+    private void RunExport(JournalDb db)
+    {
+        try
+        {
+            var files = db.ExportCsv(JournalDb.ExportDir);
+            _exportState.Text = "Export terminé : " + string.Join(", ", files.Select(Path.GetFileName));
+        }
+        catch (Exception ex)
+        {
+            Log.Write("export", ex);
+            _exportState.Text = $"Échec : {ex.Message}";
+        }
+    }
+
+    private void OpenExportFolder()
+    {
+        try
+        {
+            Directory.CreateDirectory(JournalDb.ExportDir);
+            // Explorer accepte un chemin en argument ; UseShellExecute est requis.
+            Process.Start(new ProcessStartInfo("explorer.exe", JournalDb.ExportDir)
+            {
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            Log.Write("export", ex);
+            _exportState.Text = $"Impossible d'ouvrir le dossier : {ex.Message}";
+        }
+    }
+
+    /// <summary>Décale d'un jour, ou remet à zéro si days vaut null.</summary>
+    private void ShiftDay(int? days)
+    {
+        LogicalDay.DebugOffsetDays = days is null ? 0 : LogicalDay.DebugOffsetDays + days.Value;
+        RefreshDayState();
+        DayOffsetChanged?.Invoke();
+    }
+
+    private void RefreshDayState()
+    {
+        var offset = LogicalDay.DebugOffsetDays;
+        var suffix = offset == 0 ? "aucun décalage" : $"décalage {offset:+#;-#}";
+        _dayState.Text = $"Jour logique courant : {LogicalDay.Key(LogicalDay.Today())} — {suffix}";
+    }
+
+    private static Button SmallButton(string label, Action onClick)
+    {
+        var b = new Button
+        {
+            Content = label,
+            Padding = new Thickness(12, 5, 12, 5),
+            Margin = new Thickness(0, 0, 8, 0),
+            Background = Brushes.Transparent,
+            Foreground = Brushes.White,
+            BorderBrush = MainWindow.Line,
+            Cursor = Cursors.Hand
+        };
+        b.Click += (_, _) => onClick();
+        return b;
     }
 
     private static UIElement Section(string title) => new TextBlock

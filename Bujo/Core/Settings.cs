@@ -30,6 +30,17 @@ public sealed class Settings(JournalDb db)
         set => db.SetLocal("settings.vps_url", value);
     }
 
+    /// <summary>
+    /// Déverrouille les outils de mise au point. Local à l'appareil comme le reste
+    /// des réglages : activé sur la machine de développement, jamais sur celle
+    /// d'usage quotidien, sans que la synchro future ait son mot à dire.
+    /// </summary>
+    public bool DeveloperMode
+    {
+        get => db.GetLocal("settings.developer_mode") == "1";
+        set => db.SetLocal("settings.developer_mode", value ? "1" : "0");
+    }
+
     public CloseAction CloseAction
     {
         get => db.GetLocal("settings.close_action") == "quit" ? CloseAction.Quit : CloseAction.MinimizeToTray;

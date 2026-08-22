@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -32,6 +32,7 @@
     <EmbeddedResource Include="Data\migrations\002_typed_habits.sql" LogicalName="Bujo.Data.migrations.002_typed_habits.sql" />
     <EmbeddedResource Include="Data\migrations\003_habit_archive.sql" LogicalName="Bujo.Data.migrations.003_habit_archive.sql" />
     <EmbeddedResource Include="Data\migrations\004_drop_unit_target.sql" LogicalName="Bujo.Data.migrations.004_drop_unit_target.sql" />
+    <EmbeddedResource Include="Data\migrations\005_migration_chain.sql" LogicalName="Bujo.Data.migrations.005_migration_chain.sql" />
   </ItemGroup>
 
 </Project>

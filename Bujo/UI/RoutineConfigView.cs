@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
@@ -10,11 +11,16 @@ using Button = System.Windows.Controls.Button;
 using CheckBox = System.Windows.Controls.CheckBox;
 using Color = System.Windows.Media.Color;
 using ComboBox = System.Windows.Controls.ComboBox;
+// System.Windows.Forms a perdu ContextMenu et MenuItem au passage à .NET Core,
+// mais les aliases coûtent zéro et ferment la question pour de bon.
+using ContextMenu = System.Windows.Controls.ContextMenu;
 using Cursors = System.Windows.Input.Cursors;
 using DataObject = System.Windows.DataObject;
 using DragDropEffects = System.Windows.DragDropEffects;
 using DragEventArgs = System.Windows.DragEventArgs;
 using HAlign = System.Windows.HorizontalAlignment;
+using MenuItem = System.Windows.Controls.MenuItem;
+using MessageBox = System.Windows.MessageBox;
 using MouseEventArgs = System.Windows.Input.MouseEventArgs;
 using Orientation = System.Windows.Controls.Orientation;
 using Point = System.Windows.Point;
@@ -28,7 +34,7 @@ namespace Bujo.Ui;
 /// « Appliquer » : rien n'est écrit tant que tu n'as pas confirmé.
 /// Réordonnancement par glisser-déposer depuis la poignée à gauche de chaque ligne.
 /// </summary>
-public sealed class RoutineConfigView : DockPanel
+public sealed class RoutineConfigView : DockPanel, IRefreshable
 {
     private sealed class Draft
     {
@@ -38,12 +44,22 @@ public sealed class RoutineConfigView : DockPanel
         public bool IsRoutine = true;
         public bool Active = true;
         public bool Archived;
+
+        /// <summary>
+        /// Suppression franche en attente. Distincte d'Archived : l'archivage garde
+        /// l'historique lisible, ceci l'efface. Reste un brouillon jusqu'à
+        /// « Appliquer », donc « Annuler » la défait — la seule chance d'annuler
+        /// qu'aura jamais cette opération.
+        /// </summary>
+        public bool Deleted;
     }
 
     private static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(0x5A, 0xC8, 0x8A));
+    private static readonly Brush Danger = new SolidColorBrush(Color.FromRgb(0xD1, 0x50, 0x50));
     private const string DragFormat = "BujoHabitDraft";
 
     private readonly JournalDb _db;
+    private readonly Settings _settings;
     private readonly StackPanel _rows = new();
     private readonly TextBlock _status;
     private List<Draft> _drafts = [];
@@ -61,9 +77,10 @@ public sealed class RoutineConfigView : DockPanel
     /// <summary>Levé après écriture en base, pour que l'appelant reteste le verrou.</summary>
     public event Action? Applied;
 
-    public RoutineConfigView(JournalDb db)
+    public RoutineConfigView(JournalDb db, Settings settings)
     {
         _db = db;
+        _settings = settings;
 
         var footer = new DockPanel { Margin = new Thickness(0, 16, 0, 0) };
         DockPanel.SetDock(footer, Dock.Bottom);
@@ -134,6 +151,19 @@ public sealed class RoutineConfigView : DockPanel
 
     // ------------------------------------------------------------- chargement
 
+    /// <summary>
+    /// Relecture depuis la base, sauf si un brouillon attend d'être appliqué.
+    ///
+    /// Sans cette garde, saisir trois habitudes, passer voir le Suivi et revenir
+    /// effacerait la saisie sans un mot. L'application est explicite ; l'abandon
+    /// doit l'être aussi, et c'est le rôle du bouton « Annuler ».
+    /// </summary>
+    public void Refresh()
+    {
+        if (_dirty) return;
+        Load();
+    }
+
     private void Load()
     {
         _drafts = _db.GetHabits().Select(h => new Draft
@@ -152,15 +182,26 @@ public sealed class RoutineConfigView : DockPanel
     private void RenderRows()
     {
         _rows.Children.Clear();
-        var visible = _drafts.Where(d => !d.Archived).ToList();
+        var visible = _drafts.Where(d => !d.Archived && !d.Deleted).ToList();
 
         foreach (var draft in visible)
             _rows.Children.Add(BuildRow(draft));
 
         var routineCount = visible.Count(d => d.IsRoutine && d.Active);
-        _status.Text = routineCount == 0
+        var text = routineCount == 0
             ? "Aucune habitude dans la routine : l'écran de verrouillage n'apparaîtra pas."
             : $"{routineCount} habitude{(routineCount > 1 ? "s" : "")} dans la routine du matin.";
+
+        // Une suppression en attente ne doit jamais être discrète : la ligne a
+        // disparu de la liste, seul ce texte dit ce qui va réellement se passer.
+        var doomed = _drafts.Count(d => d.Deleted && d.Id is not null);
+        if (doomed > 0)
+            text += doomed == 1
+                ? "  1 habitude et tout son historique seront supprimés définitivement à l'application."
+                : $"  {doomed} habitudes et tout leur historique seront supprimées définitivement à l'application.";
+
+        _status.Text = text;
+        _status.Foreground = doomed > 0 ? Danger : MainWindow.Muted;
     }
 
     private UIElement BuildRow(Draft d)
@@ -253,13 +294,12 @@ public sealed class RoutineConfigView : DockPanel
         Grid.SetColumn(inRoutine, 3);
         grid.Children.Add(inRoutine);
 
-        var trash = SmallButton("🗑", () =>
-        {
-            // Archivage, pas suppression : l'historique de cette habitude reste consultable.
-            if (d.Id is null) _drafts.Remove(d);
-            else d.Archived = true;
-            MarkDirty();
-        });
+        var trash = SmallButton("🗑", () => { });
+        trash.ToolTip = "Archiver ou supprimer";
+        trash.ContextMenu = BuildTrashMenu(trash, d);
+        // Clic gauche ouvre aussi le menu : sur une action à deux issues dont l'une
+        // est irréversible, le geste ne doit pas trancher tout seul.
+        trash.Click += (_, _) => trash.ContextMenu.IsOpen = true;
         Grid.SetColumn(trash, 4);
         grid.Children.Add(trash);
 
@@ -268,6 +308,65 @@ public sealed class RoutineConfigView : DockPanel
         border.PreviewDrop += (_, e) => HandleDrop(border, e);
 
         return border;
+    }
+
+    /// <summary>
+    /// Menu de la corbeille. Deux issues très différentes, d'où le menu plutôt qu'un
+    /// bouton : archiver conserve l'historique, supprimer l'efface.
+    ///
+    /// PIÈGE WPF : un ContextMenu vit dans son propre arbre visuel, en dehors de la
+    /// fenêtre. Il n'hérite donc RIEN du thème sombre de l'application et s'affiche
+    /// sur le fond clair du système — un libellé blanc y serait invisible. Les
+    /// couleurs sont posées ici, à la main.
+    /// </summary>
+    private ContextMenu BuildTrashMenu(UIElement target, Draft d)
+    {
+        var menu = new ContextMenu
+        {
+            PlacementTarget = target,
+            Placement = PlacementMode.Bottom,
+            Background = MainWindow.Panel,
+            BorderBrush = MainWindow.Line
+        };
+
+        var archive = new MenuItem
+        {
+            Header = "Archiver",
+            Foreground = Brushes.White,
+            Background = Brushes.Transparent,
+            ToolTip = "Retire l'habitude de la configuration. Son historique reste lisible dans le Suivi."
+        };
+        archive.Click += (_, _) =>
+        {
+            // Une habitude jamais écrite en base n'a rien à archiver : on la retire.
+            if (d.Id is null) _drafts.Remove(d);
+            else d.Archived = true;
+            MarkDirty();
+        };
+        menu.Items.Add(archive);
+
+        var delete = new MenuItem
+        {
+            Header = "Supprimer définitivement",
+            Foreground = Danger,
+            Background = Brushes.Transparent,
+            ToolTip = "Efface l'habitude ET toutes ses entrées. Irréversible une fois appliqué."
+        };
+        delete.Click += (_, _) =>
+        {
+            if (d.Id is null) _drafts.Remove(d);
+            else d.Deleted = true;
+            MarkDirty();
+        };
+        menu.Items.Add(delete);
+
+        // Visibilité décidée à l'ouverture et non à la construction : la case du mode
+        // développeur peut être cochée dans l'onglet Paramètres sans que cette vue
+        // soit reconstruite entre-temps.
+        menu.Opened += (_, _) =>
+            delete.Visibility = _settings.DeveloperMode ? Visibility.Visible : Visibility.Collapsed;
+
+        return menu;
     }
 
     // ---------------------------------------------------- glisser-déposer
@@ -329,16 +428,19 @@ public sealed class RoutineConfigView : DockPanel
 
         e.Handled = true;
 
-        var visible = _drafts.Where(x => !x.Archived).ToList();
+        // Même filtre que RenderRows, obligatoirement : une ligne invisible laissée
+        // dans cette liste décalerait l'index d'insertion d'un cran par rapport à
+        // ce que tu vois à l'écran.
+        var visible = _drafts.Where(x => !x.Archived && !x.Deleted).ToList();
         var below = e.GetPosition(target).Y > target.ActualHeight / 2;
 
         visible.Remove(dragged);
         var index = visible.IndexOf(over) + (below ? 1 : 0);
         visible.Insert(Math.Clamp(index, 0, visible.Count), dragged);
 
-        // L'ordre de _drafts est l'ordre d'affichage ; les archivées sont reléguées
-        // à la fin, elles n'ont plus de position visible.
-        _drafts = [.. visible, .. _drafts.Where(x => x.Archived)];
+        // L'ordre de _drafts est l'ordre d'affichage ; celles qui sont sorties de la
+        // liste sont reléguées à la fin, elles n'ont plus de position visible.
+        _drafts = [.. visible, .. _drafts.Where(x => x.Archived || x.Deleted)];
         MarkDirty();
     }
 
@@ -383,9 +485,39 @@ public sealed class RoutineConfigView : DockPanel
 
     private void ApplyChanges()
     {
+        // La confirmation vit ici, pas au clic sur « Supprimer » : c'est le seul
+        // instant où la destruction a réellement lieu, et le seul où l'on peut
+        // annoncer le total exact. Refuser annule l'application ENTIÈRE, le
+        // brouillon reste intact — appliquer la moitié d'une intention serait pire.
+        var doomed = _drafts.Where(d => d.Deleted && d.Id is not null).ToList();
+        if (doomed.Count > 0)
+        {
+            var entries = doomed.Sum(d => _db.CountHabitEntries(d.Id!));
+            var names = string.Join(", ", doomed.Select(d => d.Name.Trim()));
+
+            var answer = MessageBox.Show(
+                $"{names}\n\n"
+                + $"{doomed.Count} habitude{(doomed.Count > 1 ? "s" : "")} et "
+                + $"{entries} entrée{(entries > 1 ? "s" : "")} d'historique seront définitivement effacées. "
+                + "Cette opération ne laisse aucune trace et ne peut pas être annulée.\n\n"
+                + "Pour conserver l'historique, utilise « Archiver » à la place.",
+                "Supprimer définitivement ?",
+                MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+
+            if (answer != MessageBoxResult.Yes) return;
+        }
+
         var position = 0;
         foreach (var d in _drafts)
         {
+            // Testé avant Archived : une habitude marquée pour suppression n'a pas
+            // à passer par un archivage intermédiaire.
+            if (d.Deleted)
+            {
+                if (d.Id is not null) _db.DeleteHabitForever(d.Id);
+                continue;
+            }
+
             if (d.Archived)
             {
                 if (d.Id is not null) _db.ArchiveHabit(d.Id);

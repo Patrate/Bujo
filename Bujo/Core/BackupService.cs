@@ -55,6 +55,14 @@ public sealed class BackupService(JournalDb db, Settings settings) : IDisposable
         {
             work = new JournalDb();
 
+            // Décalage de mise au point en cours : les jours défilent à la main, et
+            // une sauvegarde automatique écrirait un fichier daté du futur. Comme la
+            // rotation ne garde que les 14 noms les plus récents, ces fichiers
+            // passeraient devant et effaceraient les vraies sauvegardes.
+            // Le bouton « Sauvegarder maintenant » reste actif : une action demandée
+            // explicitement ne se refuse pas en silence.
+            if (dueOnly && LogicalDay.DebugOffsetDays != 0) return null;
+
             if (dueOnly
                 && DateOnly.TryParse(work.GetLocal("backup.last_day"), out var last)
                 && last == LogicalDay.Today()) return null;
@@ -81,7 +89,11 @@ public sealed class BackupService(JournalDb db, Settings settings) : IDisposable
                 ? $"Copie locale OK, envoi échoué : {ex.Message}"
                 : $"Échec : {ex.Message}";
             try { work?.SetLocal("backup.last_result", message); } catch (Exception) { /* base inaccessible */ }
-            Log(ex);
+            // Log.Write n'échoue jamais : indispensable ici, on est DANS un catch
+            // sur un thread de pool. Une exception qui sortirait d'ici tuerait le
+            // processus, ce que la promesse « aucune exception ne sort d'ici »
+            // était censée empêcher.
+            Log.Write("backup", ex);
             return null;
         }
         finally
@@ -184,10 +196,6 @@ public sealed class BackupService(JournalDb db, Settings settings) : IDisposable
         db.SetLocal("backup.key_path", keyPath.Trim());
         db.SetLocal("backup.key_passphrase", Secret.Protect(passphrase) ?? "");
     }
-
-    private static void Log(Exception ex) =>
-        File.AppendAllText(Path.Combine(Path.GetTempPath(), "bujo-error.log"),
-            $"{DateTimeOffset.Now:O} backup {ex}\n");
 
     public void Dispose() => _timer?.Dispose();
 }

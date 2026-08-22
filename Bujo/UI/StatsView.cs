@@ -18,7 +18,7 @@ namespace Bujo.Ui;
 /// Vues de suivi : régularité de la routine, séries par habitude, et évolution
 /// des valeurs numériques. Lecture seule, rien n'est modifiable ici.
 /// </summary>
-public sealed class StatsView : DockPanel
+public sealed class StatsView : DockPanel, IRefreshable
 {
     private const int WindowDays = 84;        // 12 semaines, la largeur de la grille
     private const int RateWindow = 30;
@@ -26,7 +26,6 @@ public sealed class StatsView : DockPanel
     private static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(0x5A, 0xC8, 0x8A));
     private static readonly Brush Empty  = new SolidColorBrush(Color.FromRgb(0x25, 0x29, 0x30));
     private static readonly Brush Dim    = new SolidColorBrush(Color.FromRgb(0x6A, 0x70, 0x7C));
-    private static readonly Brush Warn   = new SolidColorBrush(Color.FromRgb(0xD8, 0x8A, 0x5A));
 
     private readonly JournalDb _db;
     private readonly ListBox _habitList = new();
@@ -69,24 +68,22 @@ public sealed class StatsView : DockPanel
         Refresh();
     }
 
-    /// <summary>À appeler quand l'onglet redevient visible.</summary>
+    /// <summary>
+    /// Relit tout. La vue est en lecture seule et n'a pas de navigation à préserver
+    /// au-delà de l'habitude sélectionnée, restaurée plus bas : Activate garde donc
+    /// l'implémentation par défaut de l'interface.
+    /// </summary>
     public void Refresh()
     {
         var today = LogicalDay.Today();
         var from = today.AddDays(-(RateWindow - 1));
 
         var completed = _db.GetRoutineCompletedDays(from, today).Count;
-        var bypasses = _db.GetBypassDays(from, today);
 
-        _summary.Inlines.Clear();
-        _summary.Inlines.Add(new System.Windows.Documents.Run(
-            $"Routine validée {completed} jour{(completed > 1 ? "s" : "")} sur les {RateWindow} derniers.  "));
-        _summary.Inlines.Add(new System.Windows.Documents.Run(
-            bypasses.Count == 0
-                ? "Aucune sortie forcée."
-                : $"{bypasses.Count} sortie{(bypasses.Count > 1 ? "s" : "")} forcée{(bypasses.Count > 1 ? "s" : "")}, "
-                  + $"la dernière le {bypasses[0]:dd/MM}.")
-        { Foreground = bypasses.Count == 0 ? Dim : Warn });
+        // Plus de mention des sorties forcées : elles restent enregistrées, elles ne
+        // sont plus affichées. Le taux dit déjà la même chose sans faire la morale.
+        _summary.Text =
+            $"Routine validée {completed} jour{(completed > 1 ? "s" : "")} sur les {RateWindow} derniers.";
 
         var previous = (_habitList.SelectedItem as ListBoxItem)?.Tag as HabitSummary;
 

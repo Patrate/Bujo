@@ -79,6 +79,35 @@ public sealed partial class JournalDb
              """,
             null, ("$id", habitId), ("$t", Clock.Stamp()), ("$dev", DeviceId));
 
+    /// <summary>
+    /// Suppression franche. Avec la zone dangereuse, la seule de l'application à
+    /// faire un vrai DELETE — réservée au mode développeur.
+    ///
+    /// Les habit_entries partent d'abord, et cet ordre n'est pas une préférence :
+    /// habit_entries.habit_id référence habits(id), et foreign_keys est à ON.
+    /// Supprimer l'habitude en premier lèverait « FOREIGN KEY constraint failed ».
+    ///
+    /// Rien de tout cela n'est synchronisable : une ligne qui disparaît sans laisser
+    /// de deleted_at revient au premier échange avec un autre appareil. C'est
+    /// acceptable pour un outil de mise au point, cela ne le serait pas ailleurs.
+    /// </summary>
+    public void DeleteHabitForever(string habitId)
+    {
+        using var tx = Connection.BeginTransaction();
+        Exec("DELETE FROM habit_entries WHERE habit_id = $id;", tx, ("$id", habitId));
+        Exec("DELETE FROM habits WHERE id = $id;", tx, ("$id", habitId));
+        tx.Commit();
+    }
+
+    /// <summary>Nombre d'entrées rattachées, pour annoncer l'ampleur avant de détruire.</summary>
+    public int CountHabitEntries(string habitId)
+    {
+        using var cmd = Connection.CreateCommand();
+        cmd.CommandText = "SELECT COUNT(*) FROM habit_entries WHERE habit_id = $id;";
+        cmd.Parameters.AddWithValue("$id", habitId);
+        return Convert.ToInt32(cmd.ExecuteScalar() ?? 0);
+    }
+
     private static string TypeKey(HabitValueType t) => t switch
     {
         HabitValueType.Number => "number",

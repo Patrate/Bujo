@@ -29,7 +29,8 @@ public sealed partial class JournalDb : IDisposable
         "Bujo.Data.schema.sql",
         "Bujo.Data.migrations.002_typed_habits.sql",
         "Bujo.Data.migrations.003_habit_archive.sql",
-        "Bujo.Data.migrations.004_drop_unit_target.sql"
+        "Bujo.Data.migrations.004_drop_unit_target.sql",
+        "Bujo.Data.migrations.005_migration_chain.sql"
     ];
 
     public string DeviceId { get; private set; } = "";
@@ -212,12 +213,11 @@ public sealed partial class JournalDb : IDisposable
             ("$id", Clock.NewId()), ("$d", LogicalDay.Key(day)), ("$k", kind),
             ("$t", Clock.Stamp()), ("$dev", DeviceId));
 
-    public int CountBypasses(int lastDays = 30)
-    {
-        var since = LogicalDay.Key(LogicalDay.Today().AddDays(-lastDays));
-        return Convert.ToInt32(TryScalar(
-            $"SELECT COUNT(*) FROM lock_events WHERE kind = 'bypassed' AND logical_date >= '{since}';") ?? 0);
-    }
+    // Le compteur de sorties forcées a été retiré : information redondante avec la
+    // série et le taux, double punition un jour raté, et la dissuasion par la honte
+    // mène à l'abandon ou au contournement malhonnête. L'enregistrement dans
+    // lock_events reste, il ne coûte rien et sert l'analyse hors application ;
+    // GetBypassDays le lit encore.
 
     // ------------------------------------------------------------- plomberie
 

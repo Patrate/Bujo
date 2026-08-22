@@ -13,8 +13,8 @@ using VAlign = System.Windows.VerticalAlignment;
 namespace Bujo.Ui;
 
 /// <summary>
-/// Coquille de l'application. Chaque onglet reçoit sa vue ; seul l'onglet
-/// Paramètres est rempli à ce stade, les trois autres attendent leur contenu.
+/// Coquille de l'application. Chaque onglet reçoit sa vue ; celles qui savent se
+/// recharger implémentent IRefreshable et sont réveillées à l'entrée dans l'onglet.
 /// </summary>
 public sealed class MainWindow : Window
 {
@@ -50,23 +50,36 @@ public sealed class MainWindow : Window
             Margin = new Thickness(8)
         };
 
-        var routineView = new RoutineConfigView(db);
+        var routineView = new RoutineConfigView(db, settings);
         routineView.Applied += () => RoutineChanged?.Invoke();
-        tabs.Items.Add(Tab("Routine", routineView));
 
         var journalView = new JournalView(db);
-        tabs.Items.Add(Tab("Journal", journalView));
-
         var statsView = new StatsView(db);
-        tabs.Items.Add(Tab("Suivi", statsView));
-
         var settingsView = new SettingsView(settings, db, backupService);
+
+        tabs.Items.Add(Tab("Routine", routineView));
+        tabs.Items.Add(Tab("Journal", journalView));
+        tabs.Items.Add(Tab("Suivi", statsView));
         tabs.Items.Add(Tab("Paramètres", settingsView));
-        
+
+        // Une liste plutôt qu'un index codé en dur : c'est le if (SelectedIndex == 1)
+        // précédent qui laissait le Suivi obsolète après l'ajout d'une habitude, et
+        // qui aurait reproduit le bug au prochain onglet ajouté.
+        IRefreshable[] views = [routineView, journalView, statsView];
+
         settingsView.DataChanged += () =>
         {
-            journalView.Refresh();
-            statsView.Refresh();
+            // Refresh et non Activate : effacer l'historique est une opération de
+            // maintenance, elle n'a pas à ramener le Journal sur aujourd'hui.
+            foreach (var view in views) view.Refresh();
+        };
+
+        settingsView.DayOffsetChanged += () =>
+        {
+            // Activate et non Refresh : décaler le jour logique EST une entrée dans
+            // un autre jour. Le Journal doit suivre, sinon il continuerait d'afficher
+            // le jour d'avant tout en se disant à jour.
+            foreach (var view in views) view.Activate();
         };
 
         Content = tabs;
@@ -80,13 +93,28 @@ public sealed class MainWindow : Window
 
         Closed += (_, _) => QuitRequested?.Invoke();
         
-        tabs.SelectionChanged += (_, _) => { if (tabs.SelectedIndex == 1) journalView.Refresh(); };
+        // PIÈGE WPF : Selector.SelectionChanged est un événement routé BOUILLONNANT.
+        // Chaque ComboBox ou ListBox posée dans un onglet — type d'habitude, genre
+        // d'entrée du journal, liste des habitudes du Suivi, heure de bascule — le
+        // fait remonter jusqu'au TabControl. Sans ce filtre, choisir « Note » dans
+        // le Journal appellerait Activate() et renverrait la vue à aujourd'hui en
+        // pleine consultation d'un jour passé.
+        tabs.SelectionChanged += (_, e) =>
+        {
+            if (!ReferenceEquals(e.OriginalSource, tabs)) return;
+            if (tabs.SelectedItem is TabItem { Tag: IRefreshable view }) view.Activate();
+        };
     }
 
+    /// <summary>
+    /// Le Tag porte la vue elle-même : le Content est une Border intermédiaire,
+    /// aller la rechercher par son enfant serait fragile au premier habillage.
+    /// </summary>
     private static TabItem Tab(string header, UIElement content) => new()
     {
         Header = header,
         Foreground = Brushes.Black,
+        Tag = content as IRefreshable,
         Content = new Border
         {
             Background = Panel,

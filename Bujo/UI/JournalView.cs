@@ -12,6 +12,10 @@ using Color = System.Windows.Media.Color;
 using ComboBox = System.Windows.Controls.ComboBox;
 using Cursors = System.Windows.Input.Cursors;
 using HAlign = System.Windows.HorizontalAlignment;
+// UseWindowsForms ajoute System.Windows.Forms aux usings implicites : sans cet
+// alias, MessageBox est ambigu entre WPF et WinForms. Même raison que les alias
+// ci-dessus, et que celui de DangerZoneView.
+using MessageBox = System.Windows.MessageBox;
 using Orientation = System.Windows.Controls.Orientation;
 using TextBox = System.Windows.Controls.TextBox;
 using VAlign = System.Windows.VerticalAlignment;
@@ -22,7 +26,7 @@ namespace Bujo.Ui;
 /// Daily log d'un jour logique, avec la routine du jour en tête.
 /// Toutes les écritures sont immédiates : c'est un journal, pas un formulaire.
 /// </summary>
-public sealed class JournalView : DockPanel
+public sealed class JournalView : DockPanel, IRefreshable
 {
     private static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(0x5A, 0xC8, 0x8A));
 
@@ -144,7 +148,17 @@ public sealed class JournalView : DockPanel
         Refresh();
     }
 
-    /// <summary>À appeler aussi quand la fenêtre réapparaît : le jour logique a pu basculer.</summary>
+    /// <summary>
+    /// Entrée dans l'onglet : on revient au jour courant, qui a pu basculer pendant
+    /// que la fenêtre était ailleurs ou cachée en zone de notification.
+    ///
+    /// C'est la seule chose qui distingue cette vue des autres, et c'est la raison
+    /// d'être de l'interface : si ce saut vivait dans Refresh, cocher une case
+    /// ramènerait à aujourd'hui en pleine consultation d'un jour passé.
+    /// </summary>
+    public void Activate() => GoTo(LogicalDay.Today());
+
+    /// <summary>Relit le jour affiché. Ne déplace jamais la navigation.</summary>
     public void Refresh()
     {
         var today = LogicalDay.Today();
@@ -173,12 +187,31 @@ public sealed class JournalView : DockPanel
             return;
         }
 
+        // Refresh() reconstruit déjà la routine : appeler RenderRoutine() en plus
+        // bâtissait les lignes deux fois, et détruisait deux fois la case à cocher
+        // depuis son propre gestionnaire — de quoi perdre le curseur d'un champ
+        // de saisie numérique. Pas de récursion en revanche : RenderRoutine ne
+        // déclenche aucune écriture, RoutineRow attache ses gestionnaires après
+        // avoir posé IsChecked.
         foreach (var item in items)
-            _routine.Children.Add(new RoutineRow(_db, _day, item, () =>
-            {
-                RenderRoutine();
-                Refresh();
-            }));
+            _routine.Children.Add(new RoutineRow(_db, _day, item, OnRoutineItemChanged));
+    }
+
+    /// <summary>
+    /// Marque le jour comme validé dès que toutes les lignes le sont.
+    ///
+    /// Sans cela, une routine terminée depuis le Journal — le cas typique après une
+    /// sortie de secours — ne compterait jamais dans la série : seul LockWindow
+    /// écrivait routine_completed_at. MarkRoutineCompleted utilise COALESCE, la
+    /// rappeler ne déplace donc pas l'heure de la première validation.
+    ///
+    /// Aucun risque de déverrouillage accidentel : pendant le verrou, la fenêtre
+    /// principale est inaccessible, l'icône de zone de notification grise « Ouvrir ».
+    /// </summary>
+    private void OnRoutineItemChanged()
+    {
+        if (_db.IsRoutineDone(_day)) _db.MarkRoutineCompleted(_day);
+        Refresh();
     }
 
     private void RenderEntries()
@@ -277,23 +310,59 @@ public sealed class JournalView : DockPanel
                     _db.MigrateLogEntry(e.Id, _day.AddDays(1));
                     RenderEntries();
                 }));
-                tools.Children.Add(Tiny("✗", "Abandonner", () =>
-                {
-                    _db.SetLogState(e.Id, e.State == LogState.Dropped ? LogState.Open : LogState.Dropped);
-                    RenderEntries();
-                }));
+                // Le glyphe et l'infobulle suivent l'état : « Abandonner » posé sur
+                // une tâche déjà barrée se lit comme un bouton inerte, alors que la
+                // bascule fonctionne. C'est l'étiquette qui manquait, pas la logique.
+                var dropped = e.State == LogState.Dropped;
+                tools.Children.Add(Tiny(
+                    dropped ? "↺" : "✗",
+                    dropped ? "Reprendre la tâche" : "Abandonner",
+                    () =>
+                    {
+                        _db.SetLogState(e.Id, dropped ? LogState.Open : LogState.Dropped);
+                        RenderEntries();
+                    }));
             }
-            tools.Children.Add(Tiny("🗑", "Supprimer", () =>
-            {
-                _db.DeleteLogEntry(e.Id);
-                RenderEntries();
-            }));
+            tools.Children.Add(Tiny("🗑", "Supprimer", () => DeleteEntry(e)));
         }
 
         Grid.SetColumn(tools, 2);
         grid.Children.Add(tools);
 
         return grid;
+    }
+
+    /// <summary>
+    /// Supprimer efface toute la chaîne de reports : une tâche qui n'aurait jamais
+    /// dû exister n'a pas d'histoire à raconter. Abandonner (✗) fait l'inverse et
+    /// conserve la chaîne entière, dernier maillon barré.
+    ///
+    /// La confirmation n'apparaît qu'au-delà d'un maillon. Sur une chaîne d'un seul
+    /// élément — de très loin le cas courant — il n'y a rien d'invisible à
+    /// détruire, et un dialogue systématique ferait du bruit sans protéger.
+    /// </summary>
+    private void DeleteEntry(LogEntry entry)
+    {
+        var chain = _db.GetMigrationChain(entry.Id);
+
+        if (chain.Count > 1)
+        {
+            var reports = chain.Count - 1;
+            var answer = MessageBox.Show(
+                $"Cette tâche a été repoussée {(reports == 1 ? "une fois" : $"{reports} fois")} "
+                + $"avant d'arriver ici. La supprimer effacera les {chain.Count} entrées de la chaîne, "
+                + "sur des jours qui ne sont pas affichés.\n\n"
+                + "Pour garder la trace des reports, utilise plutôt « Abandonner ».",
+                "Supprimer la tâche et son historique ?",
+                MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
+
+            // Bouton par défaut « Non » : sur une action destructrice, un Entrée
+            // réflexe doit annuler, comme dans la zone dangereuse.
+            if (answer != MessageBoxResult.Yes) return;
+        }
+
+        _db.DeleteLogEntry(entry.Id);
+        RenderEntries();
     }
 
     private void RenderMood(int? current)

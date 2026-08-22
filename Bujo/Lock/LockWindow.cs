@@ -146,12 +146,18 @@ public sealed class LockWindow : Window
         root.Children.Add(_list);
         RenderItems();
 
-        var bypasses = _db.CountBypasses();
-        if (bypasses > 0)
+        // 365 jours de recul : borne la requête sans amputer une série plausible.
+        // La série remplace le compteur de sorties forcées, retiré volontairement —
+        // ce qui tient debout le matin, c'est ce qu'on a déjà construit, pas le
+        // rappel de ce qu'on a raté.
+        var streak = Stats.ComputeRoutine(
+            _db.GetRoutineCompletedDays(_day.AddDays(-365), _day), _day, 30).Current;
+
+        if (streak > 0)
         {
             root.Children.Add(new TextBlock
             {
-                Text = $"{bypasses} sortie{(bypasses > 1 ? "s" : "")} forcée{(bypasses > 1 ? "s" : "")} sur les 30 derniers jours",
+                Text = streak == 1 ? "1 jour d'affilée" : $"{streak} jours d'affilée",
                 FontSize = 12,
                 Opacity = 0.4,
                 Margin = new Thickness(0, 34, 0, 0)
