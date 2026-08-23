@@ -135,6 +135,13 @@ public sealed partial class JournalDb : IDisposable
                 ("$id", Clock.NewId()), ("$name", name), ("$type", type),
                 ("$pos", i), ("$t", Clock.Stamp()), ("$dev", DeviceId));
         }
+
+        // Une base vierge et une vraie base sont INDISCERNABLES à l'œil nu : le semis
+        // crée « Étirements », « Squats », « Douche », c'est-à-dire exactement les
+        // habitudes réelles. Une matinée de tests a été menée sur une base neuve sans
+        // que personne s'en aperçoive, et seul un SELECT created_at l'a révélé.
+        // Cette ligne est le seul endroit où l'application dit qu'elle est repartie de zéro.
+        Log.Write("seed", $"base vierge : routine de démarrage créée, {defaults.Length} habitudes");
     }
 
     // ------------------------------------------------------------- la routine

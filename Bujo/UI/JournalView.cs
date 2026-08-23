@@ -30,6 +30,13 @@ public sealed class JournalView : DockPanel, IRefreshable
 {
     private static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(0x5A, 0xC8, 0x8A));
 
+    /// <summary>
+    /// Nombre de reports à partir duquel le compteur apparaît. En dessous, silence :
+    /// repousser une ou deux fois est le fonctionnement normal d'un bullet journal,
+    /// pas un écart à signaler.
+    /// </summary>
+    private const int ReportsThreshold = 3;
+
     private readonly JournalDb _db;
     private readonly TextBlock _title = new();
     private readonly TextBlock _subtitle = new();
@@ -239,32 +246,67 @@ public sealed class JournalView : DockPanel, IRefreshable
         var closed = e.State is LogState.Done or LogState.Migrated or LogState.Dropped;
 
         // Puce BuJo : • tâche, ○ événement, – note ; × terminée, → migrée.
-        var glyph = new Button
+        var symbol = e.State switch
         {
-            Content = e.State switch
+            LogState.Done => "✕",
+            LogState.Migrated => "→",
+            _ => e.Kind switch { LogKind.Event => "○", LogKind.Note => "–", _ => "•" }
+        };
+
+        // Seule une tâche vivante se bascule. Pour tout le reste — événements, notes,
+        // tâches déjà migrées — la puce n'est qu'un signe typographique.
+        var togglable = e.Kind == LogKind.Task && e.State != LogState.Migrated;
+
+        // PIÈGE WPF, et il était visible depuis la V1.0 sans qu'on l'identifie : le
+        // gabarit par défaut d'un Button peint son état DÉSACTIVÉ sur le Border interne
+        // du template, pas sur la propriété Background de l'élément. Un
+        // « Background = Transparent » posé de l'extérieur est donc écrasé, et sur fond
+        // sombre chaque puce non cliquable devenait un gros carré clair.
+        //
+        // Le contournement aurait été de réécrire le gabarit. La vraie correction est
+        // de ne pas employer un bouton là où il n'y a rien à cliquer.
+        UIElement bullet;
+        if (togglable)
+        {
+            var button = new Button
             {
-                LogState.Done => "✕",
-                LogState.Migrated => "→",
-                _ => e.Kind switch { LogKind.Event => "○", LogKind.Note => "–", _ => "•" }
-            },
-            Width = 28,
-            FontSize = 15,
-            Padding = new Thickness(0),
-            Background = Brushes.Transparent,
-            BorderThickness = new Thickness(0),
-            Foreground = e.State == LogState.Done ? Accent : Brushes.White,
-            Cursor = Cursors.Hand,
-            VerticalAlignment = VAlign.Center,
-            ToolTip = e.Kind == LogKind.Task ? "Basculer terminé / à faire" : null,
-            IsEnabled = e.Kind == LogKind.Task && e.State != LogState.Migrated
-        };
-        glyph.Click += (_, _) =>
+                Content = symbol,
+                Width = 28,
+                FontSize = 15,
+                Padding = new Thickness(0),
+                Background = Brushes.Transparent,
+                BorderThickness = new Thickness(0),
+                Foreground = e.State == LogState.Done ? Accent : Brushes.White,
+                Cursor = Cursors.Hand,
+                VerticalAlignment = VAlign.Center,
+                ToolTip = "Basculer terminé / à faire"
+            };
+            button.Click += (_, _) =>
+            {
+                _db.SetLogState(e.Id, e.State == LogState.Done ? LogState.Open : LogState.Done);
+                RenderEntries();
+            };
+            bullet = button;
+        }
+        else
         {
-            _db.SetLogState(e.Id, e.State == LogState.Done ? LogState.Open : LogState.Done);
-            RenderEntries();
-        };
-        Grid.SetColumn(glyph, 0);
-        grid.Children.Add(glyph);
+            bullet = new TextBlock
+            {
+                Text = symbol,
+                // Largeur et corps recopiés du bouton : les deux puces doivent tomber
+                // sur la même colonne, sinon les lignes se décalent selon leur genre.
+                Width = 28,
+                FontSize = 15,
+                TextAlignment = TextAlignment.Center,
+                // La flèche d'une entrée migrée suit le gris de sa ligne ; un événement
+                // ou une note reste une ligne vivante, donc en blanc.
+                Foreground = e.State == LogState.Migrated ? MainWindow.Muted : Brushes.White,
+                VerticalAlignment = VAlign.Center
+            };
+        }
+
+        Grid.SetColumn(bullet, 0);
+        grid.Children.Add(bullet);
 
         var text = new TextBox
         {
@@ -289,6 +331,9 @@ public sealed class JournalView : DockPanel, IRefreshable
         grid.Children.Add(text);
 
         var tools = new StackPanel { Orientation = Orientation.Horizontal, VerticalAlignment = VAlign.Center };
+
+        var reports = ReportBadge(e);
+        if (reports is not null) tools.Children.Add(reports);
 
         if (e.State == LogState.Migrated)
         {
@@ -330,6 +375,41 @@ public sealed class JournalView : DockPanel, IRefreshable
         grid.Children.Add(tools);
 
         return grid;
+    }
+
+    /// <summary>
+    /// Compteur de reports, affiché seulement au-delà du seuil.
+    ///
+    /// Une tâche repoussée une fois, c'est la vie ordinaire ; le signaler serait un
+    /// reproche adressé à un geste normal, exactement ce que la V1.1 a démonté en
+    /// retirant le compteur de sorties forcées. Repoussée quatre fois, c'est une
+    /// information : soit la tâche est mal découpée, soit elle n'a pas sa place ici.
+    ///
+    /// Gris sourd, jamais rouge, et de la même taille quel qu'en soit le nombre : il
+    /// informe, il n'alerte pas. Conservé sur une entrée terminée — une tâche faite
+    /// après cinq reports est précisément le cas que la revue mensuelle veut voir.
+    ///
+    /// Rend null quand il n'y a rien à montrer, pour que l'appelant n'ait pas à
+    /// connaître la règle.
+    /// </summary>
+    private UIElement? ReportBadge(LogEntry e)
+    {
+        var trail = _db.GetMigrationTrail(e);
+        if (trail.Reports < ReportsThreshold) return null;
+
+        var origin = trail.Origin is null
+            ? ""
+            : $" depuis le {trail.Origin.Value.ToString("dddd d MMMM", CultureInfo.CurrentCulture)}";
+
+        return new TextBlock
+        {
+            Text = $"↻ {trail.Reports}",
+            Foreground = MainWindow.Muted,
+            FontSize = 11,
+            VerticalAlignment = VAlign.Center,
+            Margin = new Thickness(0, 0, 6, 0),
+            ToolTip = $"Repoussée {trail.Reports} fois{origin}."
+        };
     }
 
     /// <summary>

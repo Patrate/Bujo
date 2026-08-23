@@ -176,6 +176,48 @@ public sealed partial class JournalDb
         tx.Commit();
     }
 
+    /// <summary>
+    /// Ce qu'une entrée a traversé avant d'arriver ici.
+    /// </summary>
+    /// <param name="Reports">Nombre de fois où la tâche a été repoussée. Zéro si elle est née ici.</param>
+    /// <param name="Origin">
+    /// Jour du plus lointain ancêtre atteignable, ou null si l'entrée n'a pas d'histoire
+    /// ou si la chaîne est rompue avant sa racine.
+    /// </param>
+    public sealed record MigrationTrail(int Reports, DateOnly? Origin);
+
+    /// <summary>
+    /// Histoire des reports d'une entrée.
+    ///
+    /// Court-circuité sur migrated_from, que LogEntry porte déjà : une entrée née ici
+    /// — le cas de très loin le plus fréquent — ne déclenche AUCUNE requête. Sans cette
+    /// garde, afficher le Journal coûterait une requête par ligne, à chaque rendu, pour
+    /// apprendre à chaque fois qu'il n'y a rien à raconter.
+    ///
+    /// L'origine est celle du plus lointain ancêtre ATTEIGNABLE. GetMigrationChain
+    /// s'arrête dès qu'une mère manque, a été supprimée ou n'est plus en état
+    /// « migrée » : le compte et la date décrivent donc ce que la base sait encore,
+    /// pas ce qui s'est réellement passé. C'est la seule promesse tenable.
+    /// </summary>
+    public MigrationTrail GetMigrationTrail(LogEntry entry)
+    {
+        if (entry.MigratedFrom is null) return new MigrationTrail(0, null);
+
+        var chain = GetMigrationChain(entry.Id);
+        if (chain.Count <= 1) return new MigrationTrail(0, null);
+
+        return new MigrationTrail(chain.Count - 1, ReadLogicalDate(chain[^1]));
+    }
+
+    private DateOnly? ReadLogicalDate(string entryId)
+    {
+        using var cmd = Connection.CreateCommand();
+        cmd.CommandText = "SELECT logical_date FROM log_entries WHERE id = $id;";
+        cmd.Parameters.AddWithValue("$id", entryId);
+
+        return cmd.ExecuteScalar() is string raw ? DateOnly.Parse(raw) : null;
+    }
+
     /// <summary>Le strict nécessaire à la remontée de chaîne, sans passer par LogEntry.</summary>
     private sealed record ChainLink(string? MigratedFrom, string State, bool Deleted);
 
