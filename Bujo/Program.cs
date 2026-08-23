@@ -43,7 +43,7 @@ public static class Program
 
         var app = new Application { ShutdownMode = ShutdownMode.OnExplicitShutdown };
 
-        _lock = new LockController(_db);
+        _lock = new LockController(_db, _settings);
         _lock.Released += OnLockReleased;
 
         _tray = new TrayIcon(
@@ -90,6 +90,12 @@ public static class Program
             // Bascule du jour : la fenêtre de la veille se ferme pour laisser place
             // à celle du jour. Rien n'a été fait, il n'y a rien à annoncer.
             case LockRelease.DayChanged:
+                break;
+
+            // Snooze : rien non plus, et pour une autre raison. Le verrou revient de
+            // lui-même dans quelques minutes ; annoncer « à tout à l'heure » serait
+            // bavard, et féliciter ou déplorer un geste neutre serait un jugement.
+            case LockRelease.Snoozed:
                 break;
         }
     }

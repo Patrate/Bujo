@@ -32,20 +32,30 @@ public sealed partial class JournalDb
         // Le nom d'habitude est joint ici : un fichier qui ne contiendrait que des
         // UUID serait illisible dans un tableur, et obligerait à exporter une
         // troisième table pour faire la correspondance à la main.
+        //
+        // Les quatre colonnes d'horaire et habit_created_at sont là pour la même
+        // raison, depuis la V1.2 : sans elles, le fichier contiendrait des cases
+        // cochées sans jamais dire lesquelles étaient dues, et le taux deviendrait
+        // incalculable hors application. L'export serait devenu infidèle par omission.
         WriteQuery(habits, """
-            SELECT h.id            AS habit_id,
-                   h.name          AS habit_name,
-                   h.value_type    AS value_type,
-                   h.archived_at   AS habit_archived_at,
-                   e.logical_date  AS logical_date,
-                   e.done          AS done,
-                   e.done_at       AS done_at,
-                   e.value_num     AS value_num,
-                   e.value_text    AS value_text,
-                   e.created_at    AS created_at,
-                   e.updated_at    AS updated_at,
-                   e.deleted_at    AS deleted_at,
-                   e.device_id     AS device_id
+            SELECT h.id                AS habit_id,
+                   h.name              AS habit_name,
+                   h.value_type        AS value_type,
+                   h.schedule_kind     AS schedule_kind,
+                   h.schedule_days     AS schedule_days,
+                   h.schedule_interval AS schedule_interval,
+                   h.schedule_anchor   AS schedule_anchor,
+                   h.created_at        AS habit_created_at,
+                   h.archived_at       AS habit_archived_at,
+                   e.logical_date      AS logical_date,
+                   e.done              AS done,
+                   e.done_at           AS done_at,
+                   e.value_num         AS value_num,
+                   e.value_text        AS value_text,
+                   e.created_at        AS created_at,
+                   e.updated_at        AS updated_at,
+                   e.deleted_at        AS deleted_at,
+                   e.device_id         AS device_id
             FROM habit_entries e
             JOIN habits h ON h.id = e.habit_id
             ORDER BY e.logical_date, h.position, h.name;

@@ -24,6 +24,7 @@ using MessageBox = System.Windows.MessageBox;
 using MouseEventArgs = System.Windows.Input.MouseEventArgs;
 using Orientation = System.Windows.Controls.Orientation;
 using Point = System.Windows.Point;
+using RadioButton = System.Windows.Controls.RadioButton;
 using TextBox = System.Windows.Controls.TextBox;
 using VAlign = System.Windows.VerticalAlignment;
 
@@ -52,6 +53,24 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
         /// qu'aura jamais cette opération.
         /// </summary>
         public bool Deleted;
+
+        /// <summary>
+        /// Horaire en cours d'édition. Chargé depuis la base comme le reste : sans
+        /// cela, « Appliquer » écrirait un horaire quotidien par défaut et écraserait
+        /// silencieusement le réglage de chaque habitude à chaque application.
+        /// </summary>
+        public Schedule Schedule = default;
+
+        /// <summary>
+        /// Posé quand une application a été refusée à cause de cet horaire, pour que
+        /// le message n'oblige pas à retrouver la ligne à l'œil. Effacé dès que
+        /// l'horaire est réédité.
+        /// </summary>
+        public bool ScheduleInvalid;
+
+        /// <summary>Un mode hebdomadaire sans aucun jour coché n'est jamais dû : refusé à l'application.</summary>
+        public bool ScheduleIsEmpty =>
+            Schedule.Kind == ScheduleKind.Weekly && Schedule.Weekdays == 0;
     }
 
     private static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(0x5A, 0xC8, 0x8A));
@@ -72,6 +91,16 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
     private readonly Button _cancel;
     private readonly SolidColorBrush _applyBorder = new(((SolidColorBrush)MainWindow.Line).Color);
     private bool _dirty;
+
+    /// <summary>
+    /// Popup d'horaire ouvert, s'il y en a un. Un seul à la fois, et il faut pouvoir
+    /// le fermer de l'extérieur : un popup est une fenêtre à part, il ne suit ni le
+    /// défilement de la liste ni la ligne qu'il édite si celle-ci part en glissement.
+    /// </summary>
+    private Popup? _schedulePopup;
+
+    /// <summary>Zone défilante de la liste. Gardée pour fermer le popup au défilement.</summary>
+    private readonly ScrollViewer _scroll;
 
 
     /// <summary>Levé après écriture en base, pour que l'appelant reteste le verrou.</summary>
@@ -117,7 +146,9 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
         });
         header.Children.Add(new TextBlock
         {
-            Text = "Une habitude « dans la routine » bloque l'écran tant qu'elle n'est pas validée. "
+            Text = "Une habitude « dans la routine » bloque l'écran tant qu'elle n'est pas validée, "
+                 + "les jours où elle est due. Le bouton d'horaire fixe ces jours ; changer l'horaire "
+                 + "recalcule aussi les statistiques passées. "
                  + "Après application, si la routine du jour n'est pas complète, l'écran se verrouille immédiatement. "
                  + "Glisse la poignée à gauche pour réordonner.",
             FontSize = 12,
@@ -140,11 +171,28 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
 
         Children.Add(footer);
         Children.Add(header);
-        Children.Add(new ScrollViewer
+
+        _scroll = new ScrollViewer
         {
             VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
             Content = scrollContent
-        });
+        };
+        // PIÈGE WPF : un Popup est une fenêtre distincte, posée en coordonnées écran.
+        // Il ne suit pas le défilement de la liste et resterait planté en place,
+        // détaché de la ligne qu'il édite. Le recoller à chaque défilement demande de
+        // faire varier un de ses offsets pour forcer le repositionnement, ce qui est
+        // laid ; le fermer est ce que fait n'importe quel menu, et c'est sans perte
+        // puisque « Annuler » et le clic à l'extérieur ferment déjà sans écrire.
+        // Filtre sur la source, exactement pour la raison documentée dans MainWindow
+        // à propos de SelectionChanged : ScrollChanged bouillonne lui aussi. La liste
+        // déroulante d'un ComboBox de type d'habitude le ferait remonter jusqu'ici et
+        // fermerait un popup que personne n'a touché.
+        _scroll.ScrollChanged += (_, e) =>
+        {
+            if (ReferenceEquals(e.OriginalSource, _scroll)) CloseSchedulePopup();
+        };
+
+        Children.Add(_scroll);
 
         Load();
     }
@@ -172,7 +220,8 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
             Name = h.Name,
             Type = h.Type,
             IsRoutine = h.IsRoutine,
-            Active = h.Active
+            Active = h.Active,
+            Schedule = h.Schedule
         }).ToList();
         _dirty = false;
         RenderRows();
@@ -187,10 +236,30 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
         foreach (var draft in visible)
             _rows.Children.Add(BuildRow(draft));
 
-        var routineCount = visible.Count(d => d.IsRoutine && d.Active);
-        var text = routineCount == 0
-            ? "Aucune habitude dans la routine : l'écran de verrouillage n'apparaîtra pas."
-            : $"{routineCount} habitude{(routineCount > 1 ? "s" : "")} dans la routine du matin.";
+        var routine = visible.Where(d => d.IsRoutine && d.Active).ToList();
+        var routineCount = routine.Count;
+
+        // Deux causes bien distinctes à une routine vide, et depuis la V1.2 la seconde
+        // est ordinaire : aucune habitude configurée, ou des habitudes configurées dont
+        // aucune n'est due aujourd'hui. Dire « aucune habitude dans la routine » dans
+        // le second cas serait faux, et laisserait croire à une configuration perdue.
+        //
+        // Seule la règle est consultée, pas la borne de création : ce jour-ci ne peut
+        // pas précéder la création d'une habitude qu'on est en train d'éditer.
+        var today = LogicalDay.Today();
+        var dueToday = routine.Count(d => d.Schedule.IsDue(today));
+
+        string text;
+        if (routineCount == 0)
+            text = "Aucune habitude dans la routine : l'écran de verrouillage n'apparaîtra pas.";
+        else if (dueToday == 0)
+            text = $"{routineCount} habitude{(routineCount > 1 ? "s" : "")} dans la routine, "
+                 + "mais aucune n'est prévue aujourd'hui : l'écran ne se verrouillera pas.";
+        else if (dueToday < routineCount)
+            text = $"{routineCount} habitudes dans la routine du matin, "
+                 + $"dont {dueToday} prévue{(dueToday > 1 ? "s" : "")} aujourd'hui.";
+        else
+            text = $"{routineCount} habitude{(routineCount > 1 ? "s" : "")} dans la routine du matin.";
 
         // Une suppression en attente ne doit jamais être discrète : la ligne a
         // disparu de la liste, seul ce texte dit ce qui va réellement se passer.
@@ -207,7 +276,8 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
     private UIElement BuildRow(Draft d)
     {
         var grid = new Grid();
-        foreach (var star in new[] { false, true, false, false, false })
+        // Poignée, nom (extensible), type, horaire, routine, corbeille.
+        foreach (var star in new[] { false, true, false, false, false, false })
             grid.ColumnDefinitions.Add(new ColumnDefinition
             {
                 Width = star ? new GridLength(1, GridUnitType.Star) : GridLength.Auto
@@ -280,6 +350,10 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
         Grid.SetColumn(type, 2);
         grid.Children.Add(type);
 
+        var schedule = ScheduleButton(d);
+        Grid.SetColumn(schedule, 3);
+        grid.Children.Add(schedule);
+
         var inRoutine = new CheckBox
         {
             Content = "Routine",
@@ -291,7 +365,7 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
         };
         inRoutine.Checked += (_, _) => { d.IsRoutine = true; d.Active = true; MarkDirty(); };
         inRoutine.Unchecked += (_, _) => { d.IsRoutine = false; MarkDirty(); };
-        Grid.SetColumn(inRoutine, 3);
+        Grid.SetColumn(inRoutine, 4);
         grid.Children.Add(inRoutine);
 
         var trash = SmallButton("🗑", () => { });
@@ -300,7 +374,7 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
         // Clic gauche ouvre aussi le menu : sur une action à deux issues dont l'une
         // est irréversible, le geste ne doit pas trancher tout seul.
         trash.Click += (_, _) => trash.ContextMenu.IsOpen = true;
-        Grid.SetColumn(trash, 4);
+        Grid.SetColumn(trash, 5);
         grid.Children.Add(trash);
 
         border.PreviewDragOver += (_, e) => ShowInsertionMark(border, e);
@@ -369,6 +443,370 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
         return menu;
     }
 
+    // -------------------------------------------------------------- horaire
+
+    /// <summary>
+    /// Bouton d'horaire de la ligne. Il affiche l'état courant en abrégé et ouvre le
+    /// popup d'édition ; la bordure passe au rouge quand une application vient d'être
+    /// refusée à cause de cet horaire.
+    /// </summary>
+    private Button ScheduleButton(Draft d)
+    {
+        var label = new TextBlock
+        {
+            Text = d.Schedule.DescribeShort(),
+            TextTrimming = TextTrimming.CharacterEllipsis
+        };
+
+        var b = new Button
+        {
+            Content = label,
+            MinWidth = 118,
+            MaxWidth = 160,
+            Margin = new Thickness(8, 0, 0, 0),
+            Padding = new Thickness(8, 4, 8, 4),
+            FontSize = 12,
+            Background = Brushes.Transparent,
+            Foreground = d.ScheduleInvalid ? Danger : Brushes.White,
+            BorderBrush = d.ScheduleInvalid ? Danger : MainWindow.Line,
+            Cursor = Cursors.Hand,
+            VerticalAlignment = VAlign.Center,
+            // Le libellé abrégé peut être tronqué : l'infobulle porte la version longue.
+            ToolTip = $"Horaire : {d.Schedule.Describe()}.\n"
+                    + "Changer l'horaire recalcule aussi les statistiques passées.",
+            AllowDrop = false
+        };
+        b.Click += (_, _) => OpenSchedulePopup(b, d);
+        return b;
+    }
+
+    /// <summary>
+    /// Éditeur d'horaire. Travaille sur une COPIE : c'est un brouillon dans le
+    /// brouillon. « Terminé » écrit dans le Draft, « Annuler », Échap et le clic à
+    /// l'extérieur ferment sans rien écrire — le clic à l'extérieur vaut abandon et
+    /// non validation silencieuse, sinon « Terminé » ne voudrait rien dire.
+    ///
+    /// Un mode hebdomadaire sans jour coché n'est pas empêché ici : la fenêtre le
+    /// signale et c'est « Appliquer » qui refuse. Interdire de décocher la dernière
+    /// case, ou la recocher dans le dos, serait agir contre le geste en cours.
+    /// </summary>
+    private void OpenSchedulePopup(Button anchor, Draft d)
+    {
+        CloseSchedulePopup();
+
+        var working = d.Schedule;
+        // Garde-fou de réentrance : Sync() repose les IsChecked des sept bascules, ce
+        // qui relance leurs gestionnaires, qui rappelleraient Sync(). Classique dès
+        // qu'un état est reflété dans des contrôles qui le modifient aussi.
+        var syncing = false;
+
+        // PIÈGE WPF, et il est vicieux : une ComboBox dans un Popup à StaysOpen =
+        // false se saborde. Sa liste déroulante est un popup imbriqué, dans un autre
+        // arbre visuel, si bien que le clic sur un élément est compté comme un clic à
+        // l'extérieur — le popup parent se referme à l'instant précis du choix.
+        // Trois boutons radio n'ouvrent rien et ferment la question.
+        var modePanel = new StackPanel { Margin = new Thickness(0, 0, 0, 12) };
+        var modeDaily = ModeOption("Tous les jours");
+        var modeWeekly = ModeOption("Jours de la semaine");
+        var modeInterval = ModeOption("Tous les X jours");
+        modePanel.Children.Add(modeDaily);
+        modePanel.Children.Add(modeWeekly);
+        modePanel.Children.Add(modeInterval);
+
+        // ORDRE IMPOSÉ PAR LE COMPILATEUR, et le motif mérite d'être écrit : Sync()
+        // est une fonction locale, et C# exige que TOUTES les variables qu'elle
+        // capture soient assignées au point d'appel — y compris quand cet appel est
+        // enfoui dans un lambda différé, dont l'analyse se fait à sa position dans le
+        // texte (CS0165). Tous les contrôles que Sync touche sont donc déclarés ici,
+        // avant le moindre gestionnaire ; leur contenu est rempli plus bas.
+        var toggles = new List<ToggleButton>(7);
+        var weekPanel = new StackPanel { Orientation = Orientation.Horizontal };
+        var intervalPanel = new StackPanel();
+
+        var intervalValue = new TextBlock
+        {
+            Foreground = Brushes.White,
+            FontSize = 13,
+            MinWidth = 26,
+            TextAlignment = TextAlignment.Center,
+            VerticalAlignment = VAlign.Center
+        };
+
+        var anchorValue = new TextBlock
+        {
+            Foreground = Brushes.White,
+            FontSize = 13,
+            MinWidth = 128,
+            TextAlignment = TextAlignment.Center,
+            VerticalAlignment = VAlign.Center
+        };
+
+        var warning = new TextBlock
+        {
+            Text = "Aucun jour coché : l'application sera refusée.",
+            Foreground = Danger,
+            FontSize = 12,
+            TextWrapping = TextWrapping.Wrap,
+            MaxWidth = 230,
+            Margin = new Thickness(0, 10, 0, 0)
+        };
+
+        // ---------------------------------------------------------- hebdomadaire
+        string[] initials = ["L", "M", "M", "J", "V", "S", "D"];
+        string[] longNames = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"];
+
+        for (var i = 0; i < 7; i++)
+        {
+            var bit = 1 << i;
+            var toggle = new ToggleButton
+            {
+                Content = initials[i],
+                Width = 28,
+                Height = 28,
+                Margin = new Thickness(0, 0, 4, 0),
+                FontSize = 12,
+                Cursor = Cursors.Hand,
+                ToolTip = longNames[i]
+            };
+            toggle.Checked += (_, _) =>
+            {
+                if (syncing) return;
+                working = working with { Weekdays = working.Weekdays | bit };
+                Sync();
+            };
+            toggle.Unchecked += (_, _) =>
+            {
+                if (syncing) return;
+                working = working with { Weekdays = working.Weekdays & ~bit };
+                Sync();
+            };
+            toggles.Add(toggle);
+            weekPanel.Children.Add(toggle);
+        }
+
+        // ------------------------------------------------------------ intervalle
+        var intervalRow = new StackPanel { Orientation = Orientation.Horizontal };
+        intervalRow.Children.Add(Legend("Tous les"));
+        intervalRow.Children.Add(Stepper("−", () => { working = Clamp(working, working.Interval - 1); Sync(); }));
+        intervalRow.Children.Add(intervalValue);
+        intervalRow.Children.Add(Stepper("+", () => { working = Clamp(working, working.Interval + 1); Sync(); }));
+        intervalRow.Children.Add(Legend("jours"));
+
+        var anchorRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
+        anchorRow.Children.Add(Legend("Calé sur le"));
+        anchorRow.Children.Add(Stepper("‹", () => { working = Shift(working, -1); Sync(); }));
+        anchorRow.Children.Add(anchorValue);
+        anchorRow.Children.Add(Stepper("›", () => { working = Shift(working, +1); Sync(); }));
+
+        // Deux flèches plutôt qu'un calendrier : l'ancrage est une PHASE, pas un
+        // début. Ce qu'on règle, c'est « sur quel jour tombent les occurrences »,
+        // et un décalage d'un jour à la fois le dit mieux qu'une date à choisir.
+        intervalPanel.Children.Add(intervalRow);
+        intervalPanel.Children.Add(anchorRow);
+
+        var actions = new StackPanel
+        {
+            Orientation = Orientation.Horizontal,
+            HorizontalAlignment = HAlign.Right,
+            Margin = new Thickness(0, 14, 0, 0)
+        };
+        var cancel = MakeButton("Annuler", CloseSchedulePopup);
+        var confirm = MakeButton("Terminé", () =>
+        {
+            d.Schedule = working;
+            d.ScheduleInvalid = false;
+            CloseSchedulePopup();
+            MarkDirty();   // reconstruit la ligne, donc le libellé du bouton
+        });
+        confirm.Margin = new Thickness(8, 0, 0, 0);
+        cancel.Padding = confirm.Padding = new Thickness(12, 4, 12, 4);
+        actions.Children.Add(cancel);
+        actions.Children.Add(confirm);
+
+        var stack = new StackPanel();
+        stack.Children.Add(new TextBlock
+        {
+            Text = "HORAIRE",
+            FontSize = 11,
+            FontWeight = FontWeights.SemiBold,
+            Foreground = MainWindow.Muted,
+            Margin = new Thickness(0, 0, 0, 10)
+        });
+        stack.Children.Add(modePanel);
+        stack.Children.Add(weekPanel);
+        stack.Children.Add(intervalPanel);
+        stack.Children.Add(warning);
+        stack.Children.Add(actions);
+
+        // PIÈGE WPF : le contenu d'un Popup vit dans un arbre visuel séparé et
+        // n'hérite RIEN du thème sombre — mêmes causes et mêmes effets que pour le
+        // ContextMenu de la corbeille. Fond et bordure sont posés à la main.
+        var content = new Border
+        {
+            Background = MainWindow.Panel,
+            BorderBrush = MainWindow.Line,
+            BorderThickness = new Thickness(1),
+            Padding = new Thickness(14),
+            Child = stack,
+            // Sans Focusable ET sans Focus() à l'ouverture, aucune touche n'arrive
+            // jusqu'ici et Échap resterait lettre morte.
+            Focusable = true
+        };
+        content.PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key != Key.Escape) return;
+            CloseSchedulePopup();
+            e.Handled = true;
+        };
+
+        modeDaily.Checked += (_, _) =>
+        {
+            if (syncing) return;
+            working = working with { Kind = ScheduleKind.Daily };
+            Sync();
+        };
+        modeWeekly.Checked += (_, _) =>
+        {
+            if (syncing) return;
+            // Les champs des autres modes sont CONSERVÉS le temps de l'édition :
+            // basculer en hebdomadaire puis revenir à l'intervalle ne doit pas faire
+            // oublier le nombre de jours saisi. C'est JournalDb qui remet à zéro les
+            // champs hors sujet au moment d'écrire, via Canonical().
+            //
+            // Le mode naît avec le jour de la semaine courant : ouvrir un mode déjà
+            // en faute serait accueillir par un reproche.
+            working = working with
+            {
+                Kind = ScheduleKind.Weekly,
+                Weekdays = working.Weekdays != 0
+                    ? working.Weekdays
+                    : Schedule.Bit(LogicalDay.Today().DayOfWeek)
+            };
+            Sync();
+        };
+        modeInterval.Checked += (_, _) =>
+        {
+            if (syncing) return;
+            working = working with
+            {
+                Kind = ScheduleKind.Interval,
+                Interval = working.Interval >= 2 ? working.Interval : 2,
+                Anchor = working.Anchor ?? LogicalDay.Today()
+            };
+            Sync();
+        };
+
+        Sync();
+
+        _schedulePopup = new Popup
+        {
+            PlacementTarget = anchor,
+            Placement = PlacementMode.Bottom,
+            HorizontalOffset = -6,
+            // StaysOpen = false : le clic à l'extérieur ferme, et cela vaut abandon.
+            StaysOpen = false,
+            Child = content
+        };
+        _schedulePopup.Opened += (_, _) => content.Focus();
+        _schedulePopup.Closed += (_, _) => _schedulePopup = null;
+        _schedulePopup.IsOpen = true;
+
+        return;
+
+        void Sync()
+        {
+            syncing = true;
+            try
+            {
+                var weekly = working.Kind == ScheduleKind.Weekly;
+                var interval = working.Kind == ScheduleKind.Interval;
+
+                modeDaily.IsChecked = !weekly && !interval;
+                modeWeekly.IsChecked = weekly;
+                modeInterval.IsChecked = interval;
+
+                weekPanel.Visibility = weekly ? Visibility.Visible : Visibility.Collapsed;
+                intervalPanel.Visibility = interval ? Visibility.Visible : Visibility.Collapsed;
+                warning.Visibility = weekly && working.Weekdays == 0
+                    ? Visibility.Visible : Visibility.Collapsed;
+
+                for (var i = 0; i < toggles.Count; i++)
+                {
+                    var on = (working.Weekdays & (1 << i)) != 0;
+                    toggles[i].IsChecked = on;
+                    // Le gabarit par défaut d'un ToggleButton est fait pour un thème
+                    // clair et son état coché s'y voit à peine : les trois pinceaux
+                    // sont posés ici, sinon les jours choisis ne se distinguent pas.
+                    toggles[i].Background = on ? Accent : Brushes.Transparent;
+                    toggles[i].BorderBrush = on ? Accent : MainWindow.Line;
+                    toggles[i].Foreground = on ? MainWindow.Bg : Brushes.White;
+                }
+
+                intervalValue.Text = working.Interval.ToString();
+                anchorValue.Text = (working.Anchor ?? LogicalDay.Today()).ToString("ddd d MMM");
+            }
+            finally
+            {
+                syncing = false;
+            }
+        }
+    }
+
+    private void CloseSchedulePopup()
+    {
+        if (_schedulePopup is null) return;
+        _schedulePopup.IsOpen = false;
+        _schedulePopup = null;
+    }
+
+    /// <summary>Intervalle borné : en dessous de 2 la règle n'a plus de sens, au-delà d'un an non plus.</summary>
+    private static Schedule Clamp(Schedule s, int interval) =>
+        s with { Interval = Math.Clamp(interval, 2, 365) };
+
+    private static Schedule Shift(Schedule s, int days) =>
+        s with { Anchor = (s.Anchor ?? LogicalDay.Today()).AddDays(days) };
+
+    private static RadioButton ModeOption(string label) => new()
+    {
+        Content = label,
+        Foreground = Brushes.White,
+        FontSize = 13,
+        Margin = new Thickness(0, 0, 0, 6),
+        Cursor = Cursors.Hand,
+        // Un seul popup d'horaire peut être ouvert à la fois : le nom de groupe n'a
+        // pas à être unique par instance.
+        GroupName = "BujoScheduleMode"
+    };
+
+    private static TextBlock Legend(string text) => new()
+    {
+        Text = text,
+        Foreground = MainWindow.Muted,
+        FontSize = 12,
+        VerticalAlignment = VAlign.Center,
+        Margin = new Thickness(0, 0, 6, 0)
+    };
+
+    private static Button Stepper(string glyph, Action onClick)
+    {
+        var b = new Button
+        {
+            Content = glyph,
+            Width = 24,
+            Height = 24,
+            Margin = new Thickness(2, 0, 2, 0),
+            Padding = new Thickness(0),
+            FontSize = 13,
+            Background = Brushes.Transparent,
+            Foreground = Brushes.White,
+            BorderBrush = MainWindow.Line,
+            Cursor = Cursors.Hand,
+            VerticalAlignment = VAlign.Center
+        };
+        b.Click += (_, _) => onClick();
+        return b;
+    }
+
     // ---------------------------------------------------- glisser-déposer
 
     private void MaybeStartDrag(MouseEventArgs e, Border source)
@@ -381,6 +819,10 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
 
         var dragged = _pressed;
         _pressed = null;
+
+        // La ligne va se déplacer sous un popup qui, lui, ne bouge pas : on le ferme
+        // plutôt que de le laisser flotter au-dessus d'une habitude qui n'est plus là.
+        CloseSchedulePopup();
 
         source.Opacity = 0.45;
         try
@@ -485,6 +927,40 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
 
     private void ApplyChanges()
     {
+        CloseSchedulePopup();
+
+        // Un mode hebdomadaire sans aucun jour coché n'est jamais dû : l'habitude
+        // disparaîtrait de la routine et du Suivi sans que rien ne l'ait annoncé.
+        // Le refus vaut pour l'application ENTIÈRE, comme pour la suppression franche
+        // plus bas : le brouillon reste intact, on corrige et on réapplique. La
+        // bordure du bouton d'horaire passe au rouge sur les lignes fautives, pour
+        // que le message n'oblige pas à les retrouver à l'œil.
+        var invalid = _drafts
+            .Where(d => !d.Archived && !d.Deleted
+                        && !string.IsNullOrWhiteSpace(d.Name)
+                        && d.ScheduleIsEmpty)
+            .ToList();
+
+        foreach (var d in _drafts) d.ScheduleInvalid = false;
+
+        if (invalid.Count > 0)
+        {
+            foreach (var d in invalid) d.ScheduleInvalid = true;
+            RenderRows();
+
+            var names = string.Join(", ", invalid.Select(d => d.Name.Trim()));
+            MessageBox.Show(
+                $"{names}\n\n"
+                + $"{(invalid.Count > 1 ? "Ces horaires hebdomadaires n'ont" : "Cet horaire hebdomadaire n'a")} "
+                + "aucun jour coché. "
+                + $"{(invalid.Count > 1 ? "Ces habitudes ne seraient" : "Cette habitude ne serait")} "
+                + "jamais due, ni dans la routine, ni dans le suivi.\n\n"
+                + "Rien n'a été enregistré : ton brouillon est intact.",
+                "Horaire incomplet",
+                MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
         // La confirmation vit ici, pas au clic sur « Supprimer » : c'est le seul
         // instant où la destruction a réellement lieu, et le seul où l'on peut
         // annoncer le total exact. Refuser annule l'application ENTIÈRE, le
@@ -527,9 +1003,10 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
             if (string.IsNullOrWhiteSpace(d.Name)) continue;   // ligne vide : ignorée
 
             if (d.Id is null)
-                _db.AddHabit(d.Name.Trim(), d.Type, d.IsRoutine, position++);
+                _db.AddHabit(d.Name.Trim(), d.Type, d.IsRoutine, position++, d.Schedule);
             else
-                _db.UpdateHabit(new Habit(d.Id, d.Name.Trim(), d.Type, d.IsRoutine, d.Active, position++));
+                _db.UpdateHabit(new Habit(d.Id, d.Name.Trim(), d.Type, d.IsRoutine, d.Active,
+                                          position++, d.Schedule));
         }
 
         Load();

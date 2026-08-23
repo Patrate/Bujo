@@ -59,6 +59,24 @@ public sealed class SettingsView : ScrollViewer
             "Avant cette heure, la routine reste celle de la veille. Se coucher à 2 h ne fait pas basculer le jour.",
             hours));
 
+        var snooze = new ComboBox { Width = 100 };
+        foreach (var m in Settings.SnoozeChoices) snooze.Items.Add($"{m} min");
+        // IndexOf plutôt qu'un calcul : la liste n'est pas régulière. Un −1 impossible
+        // en pratique — le getter revalide déjà contre la même liste — retomberait sur
+        // la première entrée plutôt que sur une exception.
+        snooze.SelectedIndex = Math.Max(0, Array.IndexOf(Settings.SnoozeChoices, _settings.SnoozeMinutes));
+        snooze.SelectionChanged += (_, _) =>
+        {
+            if (_loading) return;
+            _settings.SnoozeMinutes = Settings.SnoozeChoices[snooze.SelectedIndex];
+        };
+        stack.Children.Add(Field(
+            "Durée du snooze",
+            "Le bouton « Encore N minutes » du verrou. Ce n'est pas une sortie forcée : "
+            + "rien n'est comptabilisé, et l'écran revient de lui-même. Le snooze expire "
+            + "aussi à la bascule du jour logique.",
+            snooze));
+
         stack.Children.Add(Section("Fenêtre"));
 
         var closeAction = new ComboBox { Width = 260 };

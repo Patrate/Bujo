@@ -227,6 +227,14 @@ public sealed partial class JournalDb
     /// <summary>
     /// Requête commune à la routine (verrou) et au journal. routineOnly = false
     /// ramène aussi les habitudes suivies hors routine, qui ne bloquent pas l'écran.
+    ///
+    /// Le filtre sur les JOURS DUS se fait en C# et non en SQL, délibérément : la
+    /// règle « tous les X jours » est un modulo sur un numéro de jour, que SQLite ne
+    /// sait exprimer qu'à coups de julianday() et de CAST, illisible et impossible à
+    /// tester hors base. Le coût est nul, la boucle porte sur une poignée de lignes.
+    ///
+    /// La borne haute de HabitSchedule reste null ici : le WHERE écarte déjà les
+    /// habitudes archivées, elles ne peuvent pas atteindre ce filtre.
     /// </summary>
     private IReadOnlyList<RoutineItem> LoadHabitEntries(DateOnly day, bool routineOnly)
     {
@@ -234,7 +242,9 @@ public sealed partial class JournalDb
         using var cmd = Connection.CreateCommand();
         cmd.CommandText = $"""
                            SELECT h.id, h.name, h.value_type,
-                                  COALESCE(e.done, 0), e.value_num, e.value_text, h.position
+                                  COALESCE(e.done, 0), e.value_num, e.value_text, h.position,
+                                  h.schedule_kind, h.schedule_days, h.schedule_interval,
+                                  h.schedule_anchor, h.created_at
                            FROM habits h
                            LEFT JOIN habit_entries e
                                   ON e.habit_id = h.id
@@ -249,6 +259,9 @@ public sealed partial class JournalDb
         using var r = cmd.ExecuteReader();
         while (r.Read())
         {
+            var schedule = new HabitSchedule(ReadSchedule(r, 7), LogicalDayOf(r.GetString(11)), null);
+            if (!schedule.IsDue(day)) continue;
+
             items.Add(new RoutineItem(
                 HabitId: r.GetString(0),
                 Name: r.GetString(1),
@@ -261,7 +274,7 @@ public sealed partial class JournalDb
         return items;
     }
 
-    /// <summary>Toutes les habitudes actives du jour, routine ou non.</summary>
+    /// <summary>Toutes les habitudes dues ce jour-là, routine ou non.</summary>
     public IReadOnlyList<RoutineItem> GetDayHabits(DateOnly day) => LoadHabitEntries(day, routineOnly: false);
 
     // ------------------------------------------------------ humeur et note

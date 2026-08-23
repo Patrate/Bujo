@@ -23,9 +23,27 @@ public sealed class StatsView : DockPanel, IRefreshable
     private const int WindowDays = 84;        // 12 semaines, la largeur de la grille
     private const int RateWindow = 30;
 
+    // Géométrie de la grille. Nommées parce que la colonne de libellés recopie la
+    // hauteur d'une case : deux valeurs en dur auraient fini par diverger.
+    private const double CellSize = 13;
+    private const double CellGap = 2;
+
     private static readonly Brush Accent = new SolidColorBrush(Color.FromRgb(0x5A, 0xC8, 0x8A));
     private static readonly Brush Empty  = new SolidColorBrush(Color.FromRgb(0x25, 0x29, 0x30));
     private static readonly Brush Dim    = new SolidColorBrush(Color.FromRgb(0x6A, 0x70, 0x7C));
+
+    /// <summary>
+    /// Gris de trame des cases sans objet : jour non dû, ou jour hors de la vie de
+    /// l'habitude. Posé à mi-chemin exact entre le fond du panneau et Empty, le gris
+    /// du raté — quatre points de luminance de part et d'autre. Plus sombre, la trame
+    /// devenait invisible ; plus clair, elle se mettait à concurrencer le raté.
+    ///
+    /// Ne rien dessiner du tout, comme le prévoyait la décision initiale, faisait
+    /// disparaître la forme même du calendrier — les jours antérieurs à la création
+    /// d'une habitude tombant dans le même cas, c'était l'essentiel de la surface qui
+    /// s'évanouissait. Ce gris ne porte aucun signal : il tient la trame, rien de plus.
+    /// </summary>
+    private static readonly Brush Faint = new SolidColorBrush(Color.FromRgb(0x21, 0x24, 0x29));
 
     private readonly JournalDb _db;
     private readonly ListBox _habitList = new();
@@ -124,24 +142,51 @@ public sealed class StatsView : DockPanel, IRefreshable
         var today = LogicalDay.Today();
         var from = today.AddDays(-(WindowDays - 1));
         var history = _db.GetHabitHistory(habit.Id, from, today);
-        var streak = Stats.Compute(history, today, RateWindow);
+
+        // Les jours dus sont demandés sur la MÊME fenêtre que l'historique. Une
+        // fenêtre plus courte tronquerait les séries sans rien dire ; c'est Stats qui
+        // en extrait ensuite la sous-fenêtre du taux.
+        var dueDays = habit.Due.DueDays(from, today);
+        var streak = Stats.Compute(history, dueDays, today, RateWindow);
 
         _detail.Children.Add(new TextBlock
         {
             Text = habit.Name,
             FontSize = 20,
             Foreground = Brushes.White,
+            Margin = new Thickness(0, 0, 0, 4)
+        });
+
+        // L'horaire est rappelé sous le nom : c'est lui qui explique les trous de la
+        // grille et le dénominateur invisible du taux. Sans cette ligne, une grille
+        // clairsemée se lit comme un historique en dents de scie.
+        _detail.Children.Add(new TextBlock
+        {
+            Text = habit.Due.Rule.Describe(),
+            FontSize = 12,
+            Foreground = Dim,
             Margin = new Thickness(0, 0, 0, 14)
         });
 
+        // « jours » pour une habitude quotidienne — l'affichage de la V1.1 reste mot
+        // pour mot — et « fois » dès que la série compte des occurrences dues et non
+        // des jours de calendrier. « 3 jours d'affilée » pour trois lundis tenus
+        // serait la félicitation mensongère qu'on cherche à éviter.
+        var unit = habit.Due.Rule.IsEveryDay ? "jours" : "fois";
+
         var cards = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 20) };
-        cards.Children.Add(Card("Série en cours", $"{streak.Current}", "jours"));
-        cards.Children.Add(Card("Meilleure série", $"{streak.Best}", "jours"));
-        cards.Children.Add(Card($"Sur {RateWindow} jours", $"{streak.Rate * 100:0}", "%"));
+        cards.Children.Add(Card("Série en cours", $"{streak.Current}", unit));
+        cards.Children.Add(Card("Meilleure série", $"{streak.Best}", unit));
+        // Rate vaut null quand rien n'était dû sur la fenêtre — habitude créée
+        // aujourd'hui, ou horaire très espacé. « 0 % » serait un reproche adressé à
+        // une exigence qui ne s'est pas encore présentée.
+        cards.Children.Add(streak.Rate is { } rate
+            ? Card($"Sur {RateWindow} jours", $"{rate * 100:0}", "%")
+            : Card($"Sur {RateWindow} jours", "—", ""));
         _detail.Children.Add(cards);
 
         _detail.Children.Add(Section("Régularité"));
-        _detail.Children.Add(BuildHeatmap(history, today));
+        _detail.Children.Add(BuildHeatmap(history, habit.Due, today));
 
         if (habit.Type == HabitValueType.Number)
         {
@@ -161,10 +206,23 @@ public sealed class StatsView : DockPanel, IRefreshable
     // ---------------------------------------------------------------- grille
 
     /// <summary>
-    /// Grille façon calendrier : une colonne par semaine, une ligne par jour.
-    /// Les cases futures de la semaine en cours restent vides, pas grisées en « manqué ».
+    /// Grille façon calendrier : une colonne par semaine, une ligne par jour de la
+    /// semaine, précédée d'une colonne de libellés.
+    ///
+    /// Quatre niveaux d'encre, et le jour NON DÛ n'en reçoit presque aucune. Le peindre
+    /// en gris Empty, couleur du raté, donnerait cinq cases d'échec sur sept à une
+    /// habitude « lundi et mercredi » parfaitement tenue — le 28 % transposé au visuel.
+    /// Mais ne rien peindre du tout faisait disparaître la trame : le gris Faint tient
+    /// la forme sans rien affirmer.
+    ///
+    /// Le bénéfice indirect est le vrai : le gris Empty cesse de vouloir dire « pas
+    /// fait » pour vouloir dire « manqué », qui est la seule information intéressante.
+    ///
+    /// Le cinquième cas, une case cochée un jour devenu non dû, n'est plus atteignable
+    /// par l'interface — GetRoutine filtre sur les jours dus. Il naît d'un changement
+    /// d'horaire rétroactif, et l'effacer serait mentir sur ce qui a eu lieu.
     /// </summary>
-    private UIElement BuildHeatmap(IReadOnlyList<HabitDay> history, DateOnly today)
+    private UIElement BuildHeatmap(IReadOnlyList<HabitDay> history, HabitSchedule schedule, DateOnly today)
     {
         var done = history.Where(h => h.Done).Select(h => h.Day).ToHashSet();
 
@@ -177,6 +235,8 @@ public sealed class StatsView : DockPanel, IRefreshable
         // Une colonne par semaine, empilée horizontalement : les sept lignes
         // correspondent alors toujours au même jour de la semaine.
         var wrapper = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HAlign.Left };
+        wrapper.Children.Add(WeekdayLabels());
+
         for (var week = 0; week < weeks; week++)
         {
             var column = new StackPanel { Orientation = Orientation.Vertical };
@@ -184,22 +244,99 @@ public sealed class StatsView : DockPanel, IRefreshable
             {
                 var day = start.AddDays(week * 7 + d);
                 var future = day > today;
+                var before = day < schedule.From;
+                var after = schedule.To is not null && day > schedule.To.Value;
+                var due = schedule.IsDue(day);
+                var held = done.Contains(day);
 
-                column.Children.Add(new Border
+                var cell = new Border
                 {
-                    Width = 13,
-                    Height = 13,
-                    Margin = new Thickness(2),
+                    Width = CellSize,
+                    Height = CellSize,
+                    Margin = new Thickness(CellGap),
                     CornerRadius = new CornerRadius(2),
-                    Background = future ? Brushes.Transparent : done.Contains(day) ? Accent : Empty,
-                    BorderBrush = future ? Empty : Brushes.Transparent,
-                    BorderThickness = new Thickness(future ? 1 : 0),
-                    ToolTip = future ? null : $"{day:dddd d MMMM} — {(done.Contains(day) ? "fait" : "non fait")}"
-                });
+                    Background = Faint,
+                    BorderBrush = Brushes.Transparent,
+                    BorderThickness = new Thickness(0)
+                };
+
+                if (future)
+                {
+                    // À venir : un contour et pas de fond. C'est le seul état qui se
+                    // distingue par la forme et non par la valeur du gris.
+                    cell.Background = Brushes.Transparent;
+                    cell.BorderBrush = Empty;
+                    cell.BorderThickness = new Thickness(1);
+                }
+                else if (due)
+                {
+                    cell.Background = held ? Accent : Empty;
+                    cell.ToolTip = $"{day:dddd d MMMM} — {(held ? "fait" : "manqué")}";
+                }
+                else if (held)
+                {
+                    // Case cochée un jour non dû : conservée, mais atténuée. La cause
+                    // est nommée précisément — « non prévu » serait faux pour un jour
+                    // antérieur à la création, où ce n'est pas l'horaire qui exclut.
+                    cell.Background = Accent;
+                    cell.Opacity = 0.45;
+                    cell.ToolTip = $"{day:dddd d MMMM} — fait, {Reason(before, after)}";
+                }
+                else
+                {
+                    // Trois causes derrière le même gris, que seule l'infobulle sépare.
+                    // L'œil n'a pas à les distinguer : dans les trois cas, rien n'était
+                    // attendu ce jour-là.
+                    cell.ToolTip = $"{day:dddd d MMMM} — {Reason(before, after)}";
+                }
+
+                column.Children.Add(cell);
             }
             wrapper.Children.Add(column);
         }
         return wrapper;
+    }
+
+    /// <summary>
+    /// Pourquoi rien n'était attendu ce jour-là. Partagé par les deux branches qui en
+    /// ont besoin : une case cochée hors des jours dus doit nommer la même cause
+    /// qu'une case vide au même endroit.
+    /// </summary>
+    private static string Reason(bool before, bool after) =>
+        before ? "avant la création de l'habitude"
+        : after ? "après l'archivage"
+        : "non prévu";
+
+    /// <summary>
+    /// Colonne de libellés à gauche de la grille. Deux lettres et non une : « M »
+    /// désignerait aussi bien mardi que mercredi.
+    ///
+    /// La hauteur de chaque libellé recopie exactement celle d'une case, marges
+    /// comprises. Toute autre valeur ferait dériver l'alignement d'une ligne à l'autre,
+    /// et une grille de suivi dont les libellés glissent ne vaut pas mieux que pas de
+    /// libellés du tout.
+    /// </summary>
+    private static UIElement WeekdayLabels()
+    {
+        string[] names = ["Lu", "Ma", "Me", "Je", "Ve", "Sa", "Di"];
+        var column = new StackPanel { Orientation = Orientation.Vertical, Margin = new Thickness(0, 0, 6, 0) };
+
+        foreach (var name in names)
+        {
+            column.Children.Add(new Border
+            {
+                Height = CellSize + 2 * CellGap,
+                Child = new TextBlock
+                {
+                    Text = name,
+                    FontSize = 9,
+                    Foreground = Dim,
+                    VerticalAlignment = VAlign.Center,
+                    HorizontalAlignment = HAlign.Right
+                }
+            });
+        }
+        return column;
     }
 
     // ----------------------------------------------------------------- courbe

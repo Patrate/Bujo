@@ -24,6 +24,26 @@ public sealed class Settings(JournalDb db)
         }
     }
 
+    /// <summary>
+    /// Durées de snooze proposées, en minutes. Liste FERMÉE et non saisie libre :
+    /// une saisie libre autoriserait 240 minutes, c'est-à-dire une sortie forcée
+    /// déguisée qui échappe à toute trace. La liste dit ce que le snooze est — le
+    /// temps que la bouilloire chauffe.
+    /// </summary>
+    public static readonly int[] SnoozeChoices = [3, 5, 10, 15, 20, 30];
+
+    /// <summary>
+    /// Durée du snooze. Le getter revalide contre la liste fermée : une valeur écrite
+    /// à la main dans local_state, ou rapatriée un jour par la synchro, ne doit pas
+    /// pouvoir contourner la borne. Toute valeur inconnue retombe sur 5 minutes.
+    /// </summary>
+    public int SnoozeMinutes
+    {
+        get => int.TryParse(db.GetLocal("settings.snooze_minutes"), out var m)
+               && SnoozeChoices.Contains(m) ? m : 5;
+        set => db.SetLocal("settings.snooze_minutes", value.ToString());
+    }
+
     public string VpsUrl
     {
         get => db.GetLocal("settings.vps_url") ?? "";

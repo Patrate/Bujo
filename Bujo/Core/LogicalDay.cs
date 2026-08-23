@@ -24,8 +24,25 @@ public static class LogicalDay
     /// </summary>
     public static int DebugOffsetDays { get; set; }
 
-    public static DateOnly For(DateTimeOffset localNow) =>
-        DateOnly.FromDateTime((localNow.LocalDateTime - Cutoff).Date).AddDays(DebugOffsetDays);
+    /// <summary>
+    /// Jour logique d'un instant donné, SANS décalage de mise au point.
+    ///
+    /// C'est la conversion à employer pour tout horodatage déjà écrit en base —
+    /// created_at, archived_at. Le décalage simule « on est demain » ; il n'a rien à
+    /// dire de ce qui s'est produit hier, et le lui appliquer pousserait le passé vers
+    /// l'avant pendant que les logical_date déjà stockés, eux, ne bougent pas.
+    ///
+    /// C'est exactement ce qui faisait tomber un taux de 100 % à 0 % au premier
+    /// « + 1 jour » : la borne de création dépassait tout l'historique.
+    /// </summary>
+    public static DateOnly Of(DateTimeOffset instant) =>
+        DateOnly.FromDateTime((instant.LocalDateTime - Cutoff).Date);
+
+    /// <summary>
+    /// Jour logique de MAINTENANT, décalage compris. Réservé à l'instant courant :
+    /// pour un horodatage lu en base, c'est <see cref="Of"/> qu'il faut.
+    /// </summary>
+    public static DateOnly For(DateTimeOffset localNow) => Of(localNow).AddDays(DebugOffsetDays);
 
     public static DateOnly Today() => For(DateTimeOffset.Now);
 

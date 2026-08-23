@@ -25,7 +25,9 @@ public sealed class LockWindow : Window
     private readonly DateOnly _day;
     private readonly Forms.Screen _screen;
     private readonly bool _interactive;
+    private readonly int _snoozeMinutes;
     private readonly Action _onRoutineComplete;
+    private readonly Action _onSnooze;
     private readonly Action _onBypass;
 
     private bool _allowClose;
@@ -33,19 +35,37 @@ public sealed class LockWindow : Window
     private DispatcherTimer? _holdTimer;
     private DateTimeOffset _holdStart;
     private Button? _bypassButton;
+    private Button? _snoozeButton;
+
+    /// <summary>
+    /// Dernier état connu du bouton de sortie, tel que RefreshExitButton l'a lu en
+    /// base. Mémorisé parce que CancelHold doit pouvoir rendre au bouton son
+    /// apparence de repos sans savoir laquelle, et sans interroger la base à chaque
+    /// mouvement de souris — MouseLeave est un événement à haute fréquence.
+    /// </summary>
+    private bool _ready;
 
     private const int BypassHoldSeconds = 5;
+
+    /// <summary>
+    /// Opacité de la sortie de secours au repos. Plus effacée qu'en V1.1 : depuis que
+    /// le snooze existe, la fuite n'est plus la seule échappatoire, et elle n'a donc
+    /// plus à être la plus visible.
+    /// </summary>
+    private const double BypassIdleOpacity = 0.30;
 
     public IntPtr Handle { get; private set; }
 
     public LockWindow(JournalDb db, DateOnly day, Forms.Screen screen, bool interactive,
-                      Action onRoutineComplete, Action onBypass)
+                      int snoozeMinutes, Action onRoutineComplete, Action onSnooze, Action onBypass)
     {
         _db = db;
         _day = day;
         _screen = screen;
         _interactive = interactive;
+        _snoozeMinutes = snoozeMinutes;
         _onRoutineComplete = onRoutineComplete;
+        _onSnooze = onSnooze;
         _onBypass = onBypass;
 
         WindowStyle = WindowStyle.None;
@@ -150,8 +170,16 @@ public sealed class LockWindow : Window
         // La série remplace le compteur de sorties forcées, retiré volontairement —
         // ce qui tient debout le matin, c'est ce qu'on a déjà construit, pas le
         // rappel de ce qu'on a raté.
+        //
+        // Les jours dus de la routine viennent sur la MÊME fenêtre que les jours
+        // validés : une fenêtre plus courte tronquerait la série en silence.
+        // Le libellé reste « N jours d'affilée » et non « N fois » — la routine est
+        // une union d'horaires, elle se compte en jours de calendrier.
+        var from = _day.AddDays(-365);
         var streak = Stats.ComputeRoutine(
-            _db.GetRoutineCompletedDays(_day.AddDays(-365), _day), _day, 30).Current;
+            _db.GetRoutineCompletedDays(from, _day),
+            _db.GetRoutineDueDays(from, _day),
+            _day, 30).Current;
 
         if (streak > 0)
         {
@@ -164,13 +192,31 @@ public sealed class LockWindow : Window
             });
         }
 
+        // Le snooze est le bouton PRINCIPAL, et c'est une décision : il doit être plus
+        // facile que la fuite. Un matin où l'on n'est pas prête, le geste offert est
+        // « encore cinq minutes », pas « sortir quand même ».
+        _snoozeButton = new Button
+        {
+            Content = $"Encore {_snoozeMinutes} minutes",
+            Margin = new Thickness(0, 26, 0, 0),
+            Padding = new Thickness(20, 11, 20, 11),
+            HorizontalAlignment = HAlign.Left,
+            Background = Brushes.Transparent,
+            Foreground = Brushes.White,
+            BorderBrush = new SolidColorBrush(Color.FromRgb(0x6A, 0x70, 0x7C)),
+            FontSize = 15,
+            Cursor = System.Windows.Input.Cursors.Hand
+        };
+        _snoozeButton.Click += (_, _) => _onSnooze();
+        root.Children.Add(_snoozeButton);
+
         _bypassButton = new Button
         {
             Content = $"Maintenir {BypassHoldSeconds} s pour sortir quand même",
-            Margin = new Thickness(0, 14, 0, 0),
+            Margin = new Thickness(0, 10, 0, 0),
             Padding = new Thickness(14, 8, 14, 8),
             HorizontalAlignment = HAlign.Left,
-            Opacity = 0.45,
+            Opacity = BypassIdleOpacity,
             Background = Brushes.Transparent,
             Foreground = Brushes.White,
             BorderBrush = new SolidColorBrush(Color.FromRgb(0x44, 0x48, 0x50)),
@@ -213,19 +259,39 @@ public sealed class LockWindow : Window
         RefreshExitButton();
     }
     
+    /// <summary>Relit l'état en base, puis rend au bouton l'apparence correspondante.</summary>
     private void RefreshExitButton()
     {
-        if (_bypassButton is null) return;
-        var ready = _db.IsRoutineDone(_day);
+        _ready = _db.IsRoutineDone(_day);
+        RestoreExitButton();
+    }
 
-        _bypassButton.Content = ready
+    /// <summary>
+    /// Applique au bouton son apparence de repos, celle du dernier état connu.
+    ///
+    /// Séparée de RefreshExitButton parce que CancelHold doit l'appeler sans relire
+    /// la base : c'est précisément l'oubli de cette restauration qui faisait
+    /// réapparaître « Maintenir 5 s » sur une routine terminée, dès que le pointeur
+    /// avait effleuré le bouton — MouseLeave appelant CancelHold sans condition.
+    /// </summary>
+    private void RestoreExitButton()
+    {
+        // Routine terminée : le snooze n'a plus rien à retarder, il disparaît. Le
+        // laisser proposerait de repousser une chose déjà faite.
+        if (_snoozeButton is not null)
+            _snoozeButton.Visibility = _ready ? Visibility.Collapsed : Visibility.Visible;
+
+        if (_bypassButton is null) return;
+
+        _bypassButton.Content = _ready
             ? "Routine terminée — quitter"
             : $"Maintenir {BypassHoldSeconds} s pour sortir quand même";
-        _bypassButton.Foreground = ready ? Brushes.White : Brushes.White;
-        _bypassButton.BorderBrush = ready
+        // Le Foreground portait un ternaire dont les deux branches étaient blanches :
+        // c'est la bordure et l'opacité qui distinguent les deux états, pas le texte.
+        _bypassButton.BorderBrush = _ready
             ? new SolidColorBrush(Color.FromRgb(0x5A, 0xC8, 0x8A))
             : new SolidColorBrush(Color.FromRgb(0x44, 0x48, 0x50));
-        _bypassButton.Opacity = ready ? 1.0 : 0.45;
+        _bypassButton.Opacity = _ready ? 1.0 : BypassIdleOpacity;
     }
 
     // ----------------------------------------------------- sortie de secours
@@ -248,7 +314,8 @@ public sealed class LockWindow : Window
             if (_bypassButton is not null)
             {
                 _bypassButton.Content = $"Continue de maintenir… {left} s";
-                _bypassButton.Opacity = 0.45 + 0.55 * (elapsed / BypassHoldSeconds);
+                _bypassButton.Opacity = BypassIdleOpacity
+                                      + (1.0 - BypassIdleOpacity) * (elapsed / BypassHoldSeconds);
             }
         };
         _holdTimer.Start();
@@ -258,8 +325,6 @@ public sealed class LockWindow : Window
     {
         _holdTimer?.Stop();
         _holdTimer = null;
-        if (_bypassButton is null) return;
-        _bypassButton.Content = $"Maintenir {BypassHoldSeconds} s pour sortir quand même";
-        _bypassButton.Opacity = 0.45;
+        RestoreExitButton();
     }
 }

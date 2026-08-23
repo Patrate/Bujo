@@ -6,13 +6,19 @@ public sealed partial class JournalDb
     /// <summary>
     /// Toutes les habitudes, archivées comprises. C'est la raison d'être de
     /// l'archivage : une habitude retirée de la routine garde son historique lisible.
+    ///
+    /// Chacune ramène son horaire BORNÉ par sa création et par son archivage, sous
+    /// forme de HabitSchedule. C'est ce qui permet au Suivi de ne rien savoir des
+    /// horaires : il demande une liste de jours dus et la passe à Stats.
     /// </summary>
     public IReadOnlyList<HabitSummary> GetHabitsForStats()
     {
         var list = new List<HabitSummary>();
         using var cmd = Connection.CreateCommand();
         cmd.CommandText = """
-            SELECT id, name, value_type, archived_at
+            SELECT id, name, value_type, archived_at,
+                   schedule_kind, schedule_days, schedule_interval, schedule_anchor,
+                   created_at
             FROM habits
             WHERE deleted_at IS NULL
             ORDER BY (archived_at IS NOT NULL), position;
@@ -21,11 +27,14 @@ public sealed partial class JournalDb
         using var r = cmd.ExecuteReader();
         while (r.Read())
         {
+            var archived = r.IsDBNull(3) ? (DateOnly?)null : LogicalDayOf(r.GetString(3));
+
             list.Add(new HabitSummary(
                 Id: r.GetString(0),
                 Name: r.GetString(1),
                 Type: ParseType(r.GetString(2)),
-                Archived: !r.IsDBNull(3)));
+                Archived: !r.IsDBNull(3),
+                Due: new HabitSchedule(ReadSchedule(r, 4), LogicalDayOf(r.GetString(8)), archived)));
         }
         return list;
     }
@@ -53,6 +62,47 @@ public sealed partial class JournalDb
                 Number: r.IsDBNull(2) ? null : r.GetDouble(2)));
         }
         return list;
+    }
+
+    /// <summary>
+    /// Jours où la ROUTINE est due sur la fenêtre donnée, par ordre croissant.
+    ///
+    /// Un jour dû pour la routine est un jour où au moins une habitude de routine est
+    /// due : l'union des horaires, pas leur intersection. Prendre l'intersection
+    /// rendrait la routine non due dès que deux habitudes ont des horaires disjoints,
+    /// et le verrou n'apparaîtrait plus jamais.
+    ///
+    /// Seules les habitudes de routine VIVANTES comptent : archiver une habitude
+    /// change donc les jours dus passés de la routine. C'est la même règle que pour
+    /// le reste — les jours dus se déduisent toujours de la configuration courante.
+    /// </summary>
+    public IReadOnlyList<DateOnly> GetRoutineDueDays(DateOnly from, DateOnly to)
+    {
+        var schedules = new List<HabitSchedule>();
+
+        using (var cmd = Connection.CreateCommand())
+        {
+            cmd.CommandText = """
+                SELECT schedule_kind, schedule_days, schedule_interval, schedule_anchor,
+                       created_at
+                FROM habits
+                WHERE is_routine = 1 AND active = 1
+                  AND archived_at IS NULL AND deleted_at IS NULL;
+                """;
+
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+                schedules.Add(new HabitSchedule(ReadSchedule(r, 0), LogicalDayOf(r.GetString(4)), null));
+        }
+
+        // SortedSet plutôt qu'une liste triée après coup : l'union doit dédoublonner,
+        // deux habitudes dues le même lundi ne font qu'un jour dû.
+        var days = new SortedSet<DateOnly>();
+        foreach (var schedule in schedules)
+            foreach (var day in schedule.DueDays(from, to))
+                days.Add(day);
+
+        return [.. days];
     }
 
     /// <summary>Jours où la routine complète a été validée, sur la fenêtre donnée.</summary>
