@@ -106,13 +106,31 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
     /// <summary>Levé après écriture en base, pour que l'appelant reteste le verrou.</summary>
     public event Action? Applied;
 
-    public RoutineConfigView(JournalDb db, Settings settings)
+    /// <summary>
+    /// Levé à chaque modification du brouillon, avant toute écriture. Sert à un hôte
+    /// qui affiche un bouton dépendant du contenu — « Terminer et verrouiller
+    /// maintenant » de la présentation — et qui doit le rafraîchir à la saisie, pas
+    /// seulement à l'entrée dans la page.
+    /// </summary>
+    public event Action? DraftChanged;
+
+    /// <summary>
+    /// Vue embarquée dans un hôte qui fournit ses propres boutons — la présentation de
+    /// premier lancement. Le pied de page « Annuler / Appliquer » disparaît, l'écriture
+    /// passe par <see cref="ApplyFromHost"/>, et l'événement Applied n'est PAS levé :
+    /// il ferait engager le verrou par-dessus la fenêtre modale de l'hôte.
+    /// </summary>
+    private readonly bool _embedded;
+
+    public RoutineConfigView(JournalDb db, Settings settings, bool embedded = false)
     {
         _db = db;
         _settings = settings;
+        _embedded = embedded;
 
         var footer = new DockPanel { Margin = new Thickness(0, 16, 0, 0) };
         DockPanel.SetDock(footer, Dock.Bottom);
+        if (_embedded) footer.Visibility = Visibility.Collapsed;
 
         _status = new TextBlock
         {
@@ -123,7 +141,8 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
         };
 
         _cancel = MakeButton("Annuler", () => Load());
-        _apply = MakeButton("Appliquer", ApplyChanges);
+        // Lambda et non groupe de méthodes : ApplyChanges rend désormais un bool.
+        _apply = MakeButton("Appliquer", () => ApplyChanges());
         _apply.Margin = new Thickness(8, 0, 0, 0);
         // Pinceau non figé et propre à ce bouton : une animation ne peut pas
         // cibler un pinceau partagé entre plusieurs contrôles.
@@ -138,6 +157,8 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
 
         var header = new StackPanel { Margin = new Thickness(0, 0, 0, 14) };
         DockPanel.SetDock(header, Dock.Top);
+        // L'hôte pose déjà son propre titre et son propre texte d'explication.
+        if (_embedded) header.Visibility = Visibility.Collapsed;
         header.Children.Add(new TextBlock
         {
             Text = "Habitudes",
@@ -895,6 +916,7 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
         _dirty = true;
         if (rerender) RenderRows();
         UpdateButtons();
+        DraftChanged?.Invoke();
     }
 
     private void UpdateButtons()
@@ -925,7 +947,13 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
 
     // -------------------------------------------------------------- écriture
 
-    private void ApplyChanges()
+    /// <summary>
+    /// Rend false quand l'application a été REFUSÉE — horaire incomplet, ou
+    /// suppression franche non confirmée. L'hôte de la présentation en a besoin :
+    /// sans cela, un refus fermerait quand même l'assistant en laissant croire que
+    /// tout a été enregistré.
+    /// </summary>
+    private bool ApplyChanges()
     {
         CloseSchedulePopup();
 
@@ -958,7 +986,7 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
                 + "Rien n'a été enregistré : ton brouillon est intact.",
                 "Horaire incomplet",
                 MessageBoxButton.OK, MessageBoxImage.Warning);
-            return;
+            return false;
         }
 
         // La confirmation vit ici, pas au clic sur « Supprimer » : c'est le seul
@@ -980,7 +1008,7 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
                 "Supprimer définitivement ?",
                 MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No);
 
-            if (answer != MessageBoxResult.Yes) return;
+            if (answer != MessageBoxResult.Yes) return false;
         }
 
         var position = 0;
@@ -1010,7 +1038,39 @@ public sealed class RoutineConfigView : DockPanel, IRefreshable
         }
 
         Load();
-        Applied?.Invoke();
+
+        // En mode intégré, Applied ferait engager le verrou par-dessus la fenêtre
+        // modale de l'hôte. C'est celui-ci qui décide de le déclencher ou non, par ses
+        // deux boutons « Terminer » et « Terminer et verrouiller maintenant ».
+        if (!_embedded) Applied?.Invoke();
+        return true;
+    }
+
+    /// <summary>
+    /// Écrit le brouillon depuis un hôte qui fournit ses propres boutons. Même chemin
+    /// que « Appliquer », refus compris : un horaire hebdomadaire vide y bloque tout
+    /// aussi bien, et l'hôte ne doit pas contourner cette garde.
+    /// </summary>
+    public bool ApplyFromHost() => ApplyChanges();
+
+    /// <summary>
+    /// Vrai si au moins une habitude du brouillon est due aujourd'hui, donc si le
+    /// verrou peut réellement apparaître maintenant.
+    ///
+    /// Lu sur le BROUILLON et non sur la base : l'hôte pose la question avant d'avoir
+    /// écrit, et un bouton « verrouiller maintenant » calculé sur l'état enregistré
+    /// serait faux exactement le jour où il compte, celui du premier lancement.
+    /// </summary>
+    public bool HasWorkToday
+    {
+        get
+        {
+            var today = LogicalDay.Today();
+            return _drafts.Any(d => !d.Archived && !d.Deleted
+                                    && !string.IsNullOrWhiteSpace(d.Name)
+                                    && d.IsRoutine && d.Active
+                                    && d.Schedule.IsDue(today));
+        }
     }
 
     // ------------------------------------------------------------- fabriques

@@ -31,7 +31,7 @@ public sealed class LockWindow : Window
     private readonly Action _onBypass;
 
     private bool _allowClose;
-    private StackPanel? _list;
+    private RoutinePanel? _panel;
     private DispatcherTimer? _holdTimer;
     private DateTimeOffset _holdStart;
     private Button? _bypassButton;
@@ -162,30 +162,22 @@ public sealed class LockWindow : Window
             Margin = new Thickness(0, 0, 0, 28)
         });
 
-        _list = new StackPanel();
-        root.Children.Add(_list);
-        RenderItems();
+        _panel = new RoutinePanel(_db, _day);
+        // Le panneau porte désormais le marquage de complétion : il ne reste ici que
+        // le rafraîchissement des boutons, qui est propre à cet écran.
+        _panel.Changed += RefreshExitButton;
+        root.Children.Add(_panel);
 
-        // 365 jours de recul : borne la requête sans amputer une série plausible.
         // La série remplace le compteur de sorties forcées, retiré volontairement —
         // ce qui tient debout le matin, c'est ce qu'on a déjà construit, pas le
         // rappel de ce qu'on a raté.
-        //
-        // Les jours dus de la routine viennent sur la MÊME fenêtre que les jours
-        // validés : une fenêtre plus courte tronquerait la série en silence.
-        // Le libellé reste « N jours d'affilée » et non « N fois » — la routine est
-        // une union d'horaires, elle se compte en jours de calendrier.
-        var from = _day.AddDays(-365);
-        var streak = Stats.ComputeRoutine(
-            _db.GetRoutineCompletedDays(from, _day),
-            _db.GetRoutineDueDays(from, _day),
-            _day, 30).Current;
+        var streak = RoutinePanel.Streak(_db, _day);
 
         if (streak > 0)
         {
             root.Children.Add(new TextBlock
             {
-                Text = streak == 1 ? "1 jour d'affilée" : $"{streak} jours d'affilée",
+                Text = RoutinePanel.StreakLabel(streak),
                 FontSize = 12,
                 Opacity = 0.4,
                 Margin = new Thickness(0, 34, 0, 0)
@@ -241,24 +233,6 @@ public sealed class LockWindow : Window
         return root;
     }
 
-    private void RenderItems()
-    {
-        if (_list is null) return;
-        _list.Children.Clear();
-
-        foreach (var item in _db.GetRoutine(_day))
-            _list.Children.Add(new RoutineRow(_db, _day, item,
-                () => { RenderItems(); CheckCompletion(); }));
-    }
-
-    private void CheckCompletion()
-    {
-        if (!_db.IsRoutineDone(_day)) { RefreshExitButton(); return; }
-        _db.MarkRoutineCompleted(_day);
-        _db.LogLockEvent(_day, "completed");
-        RefreshExitButton();
-    }
-    
     /// <summary>Relit l'état en base, puis rend au bouton l'apparence correspondante.</summary>
     private void RefreshExitButton()
     {

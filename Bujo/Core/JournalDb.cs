@@ -62,7 +62,6 @@ public sealed partial class JournalDb : IDisposable
 
         Migrate();
         EnsureDevice();
-        SeedRoutineIfEmpty();
     }
 
     // ---------------------------------------------------------------- schéma
@@ -100,49 +99,14 @@ public sealed partial class JournalDb : IDisposable
         SetLocal("device_id", DeviceId);
     }
 
-    /// <summary>
-    /// Routine de démarrage sur base neuve.
-    ///
-    /// CORRECTION V1.2 : cet INSERT nommait encore les colonnes unit et target_num,
-    /// retirées par la migration 004, et ne fournissait aucun paramètre pour elles.
-    /// Sur une base VIERGE — le seul cas où ce code s'exécute — il levait
-    /// « no such column: unit », l'exception remontait au constructeur, et Program
-    /// journalisait puis rendait 1 : première installation impossible. Aucune base
-    /// déjà semée ne pouvait révéler le défaut, ce chemin ne s'y exécute plus jamais.
-    /// </summary>
-    private void SeedRoutineIfEmpty()
-    {
-        if (TryScalar("SELECT 1 FROM habits LIMIT 1;") is not null) return;
-
-        (string Name, string Type)[] defaults =
-        [
-            ("Étirements", "bool"),
-            ("Squats",     "number"),
-            ("Douche",     "bool")
-        ];
-
-        for (var i = 0; i < defaults.Length; i++)
-        {
-            var (name, type) = defaults[i];
-            // Les colonnes d'horaire sont omises : leurs DEFAULT valent quotidienne,
-            // ce qui est bien ce qu'on veut pour une routine de démarrage.
-            Exec("""
-                 INSERT INTO habits (id, name, value_type, is_routine,
-                                     position, active, created_at, updated_at, device_id)
-                 VALUES ($id, $name, $type, 1, $pos, 1, $t, $t, $dev);
-                 """,
-                null,
-                ("$id", Clock.NewId()), ("$name", name), ("$type", type),
-                ("$pos", i), ("$t", Clock.Stamp()), ("$dev", DeviceId));
-        }
-
-        // Une base vierge et une vraie base sont INDISCERNABLES à l'œil nu : le semis
-        // crée « Étirements », « Squats », « Douche », c'est-à-dire exactement les
-        // habitudes réelles. Une matinée de tests a été menée sur une base neuve sans
-        // que personne s'en aperçoive, et seul un SELECT created_at l'a révélé.
-        // Cette ligne est le seul endroit où l'application dit qu'elle est repartie de zéro.
-        Log.Write("seed", $"base vierge : routine de démarrage créée, {defaults.Length} habitudes");
-    }
+    // Le semis de démarrage a été RETIRÉ en V1.5. Il créait « Étirements », « Squats »
+    // et « Douche » sur toute base vierge, ce qui posait deux problèmes distincts :
+    //   * il imposait à un nouvel utilisateur trois habitudes qui ne sont pas les
+    //     siennes, alors que la présentation de premier lancement les lui demande
+    //   * une base vierge devenait indiscernable de la vraie à l'œil nu, puisqu'elle
+    //     portait exactement les mêmes noms
+    // La ligne Log.Write("seed", …) ajoutée en V1.3 pour parer au second devient donc
+    // sans objet et disparaît avec le reste.
 
     // ------------------------------------------------------------- la routine
 

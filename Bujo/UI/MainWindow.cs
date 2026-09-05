@@ -29,6 +29,9 @@ public sealed class MainWindow : Window
     public event Action? QuitRequested;
     public event Action? RoutineChanged;
 
+    /// <summary>Relayé depuis les Paramètres : « Revoir la présentation ».</summary>
+    public event Action? SetupRequested;
+
     public MainWindow(JournalDb db, Settings settings, BackupService backupService)
     {
         _settings = settings;
@@ -66,6 +69,8 @@ public sealed class MainWindow : Window
         // précédent qui laissait le Suivi obsolète après l'ajout d'une habitude, et
         // qui aurait reproduit le bug au prochain onglet ajouté.
         IRefreshable[] views = [routineView, journalView, statsView];
+
+        settingsView.SetupRequested += () => SetupRequested?.Invoke();
 
         settingsView.DataChanged += () =>
         {

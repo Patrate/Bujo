@@ -35,6 +35,13 @@ public sealed class SettingsView : ScrollViewer
     /// jour, et les vues doivent suivre — d'où Activate côté MainWindow.
     /// </summary>
     public event Action? DayOffsetChanged;
+
+    /// <summary>
+    /// Demande de revoir la présentation de premier lancement. Remonte jusqu'à Program,
+    /// seul endroit qui sache quoi faire à sa fermeture — et notamment ne PAS engager
+    /// le verrou quand elle est rejouée depuis les Paramètres.
+    /// </summary>
+    public event Action? SetupRequested;
     
     public SettingsView(Settings settings, JournalDb db, BackupService backupService)
     {
@@ -45,6 +52,28 @@ public sealed class SettingsView : ScrollViewer
         Padding = new Thickness(0, 0, 14, 0);
 
         stack.Children.Add(Section("Verrouillage"));
+
+        stack.Children.Add(Field(
+            "Présentation",
+            "Revoir les écrans du premier lancement : fonctionnement général, démarrage "
+            + "automatique, mode de verrouillage, rythme et habitudes.",
+            SmallButton("Revoir la présentation", () => SetupRequested?.Invoke())));
+
+        var mode = new ComboBox { Width = 260 };
+        mode.Items.Add("Bloquant — plein écran");
+        mode.Items.Add("Souple — encart en bas à droite");
+        mode.SelectedIndex = _settings.LockMode == LockMode.Soft ? 1 : 0;
+        mode.SelectionChanged += (_, _) =>
+        {
+            if (_loading) return;
+            _settings.LockMode = mode.SelectedIndex == 1 ? LockMode.Soft : LockMode.Hard;
+        };
+        stack.Children.Add(Field(
+            "Mode",
+            "Le mode souple laisse l'ordinateur utilisable : l'encart dérange, il n'enferme pas. "
+            + "Il n'a pas de sortie de secours — le snooze suffit, puisque rien n'est bloqué. "
+            + "Un changement de mode prend effet au prochain déclenchement, pas immédiatement.",
+            mode));
 
         var hours = new ComboBox { Width = 100 };
         for (var h = 0; h <= 12; h++) hours.Items.Add($"{h:00}:00");

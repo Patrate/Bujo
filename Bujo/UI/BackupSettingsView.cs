@@ -38,6 +38,12 @@ public sealed class BackupSettingsView : StackPanel
     private readonly TextBlock _status = new();
     private readonly Button _runNow;
 
+    /// <summary>
+    /// Une sauvegarde manuelle est en cours. Remplace la désactivation du bouton, qui
+    /// le faisait virer au carré clair sur fond sombre.
+    /// </summary>
+    private bool _running;
+
     public BackupSettingsView(JournalDb db, Settings settings, BackupService backup)
     {
         _db = db;
@@ -142,21 +148,56 @@ public sealed class BackupSettingsView : StackPanel
     /// <summary>
     /// La sauvegarde part sur un thread de fond : un envoi SFTP peut prendre
     /// plusieurs secondes, et geler l'interface pendant ce temps serait inacceptable.
+    ///
+    /// Le bouton n'est PLUS désactivé pendant l'envoi, et ce n'est pas un détail
+    /// d'apparence : le gabarit par défaut d'un Button WPF peint son état désactivé
+    /// sur le Border interne du template, ce qui écrase le fond transparent posé de
+    /// l'extérieur. Sur fond sombre, le bouton virait au carré clair — même défaut que
+    /// les puces du Journal, corrigées en V1.3.
+    ///
+    /// La protection contre le double clic passe donc par un drapeau, ce qui est de
+    /// toute façon plus honnête : le libellé dit ce qui se passe, là où un bouton grisé
+    /// laissait deviner.
     /// </summary>
     private void RunNow()
     {
-        _runNow.IsEnabled = false;
+        if (_running) return;
+        _running = true;
+        ShowRunning(true);
         Announce("Sauvegarde en cours…");
 
         Task.Run(() => _backup.Run())
             .ContinueWith(task =>
             {
-                var path = task.Result;
-                Announce(path is null
-                    ? $"Échec — {_backup.LastResult}"
-                    : $"Terminée — {Path.GetFileName(path)} ({_backup.LastResult})");
-                _runNow.IsEnabled = true;
+                try
+                {
+                    var path = task.Result;
+                    Announce(path is null
+                        ? $"Échec — {_backup.LastResult}"
+                        : $"Terminée — {Path.GetFileName(path)} ({_backup.LastResult})");
+                }
+                catch (Exception ex)
+                {
+                    // BackupService.Run promet de ne jamais lever, mais le drapeau ne
+                    // doit dépendre d'aucune promesse : resté à vrai, il condamnerait
+                    // le bouton jusqu'au prochain démarrage.
+                    Log.Write("backup", ex);
+                    Announce($"Échec : {ex.Message}");
+                }
+                finally
+                {
+                    _running = false;
+                    ShowRunning(false);
+                }
             }, TaskScheduler.FromCurrentSynchronizationContext());
+    }
+
+    private void ShowRunning(bool running)
+    {
+        _runNow.Content = running ? "Sauvegarde en cours…" : "Sauvegarder maintenant";
+        _runNow.Opacity = running ? 0.45 : 1.0;
+        // Le curseur cesse d'annoncer un clic qui ne fera rien.
+        _runNow.Cursor = running ? Cursors.Arrow : Cursors.Hand;
     }
 
     private void Announce(string message) => _status.Text = message;

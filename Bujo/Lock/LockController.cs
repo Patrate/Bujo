@@ -39,6 +39,17 @@ public sealed class LockController : IDisposable
     private readonly DispatcherTimer _reassert;
     private readonly DispatcherTimer _dayWatch;
     private readonly DispatcherTimer _snoozeWatch;
+    private readonly DispatcherTimer _escalate;
+
+    private SoftLockWindow? _soft;
+
+    /// <summary>
+    /// Mode figé au moment de l'engagement, et non relu à chaque usage. Changer de
+    /// mode dans les Paramètres ne doit prendre effet qu'au PROCHAIN déclenchement :
+    /// basculer en bloquant à 6 h 10 ne doit pas faire surgir un plein écran à
+    /// l'instant du clic, alors que l'écran souple est déjà là.
+    /// </summary>
+    private LockMode _activeMode;
 
     private DateOnly _day;
     private bool _active;
@@ -57,6 +68,17 @@ public sealed class LockController : IDisposable
     /// </summary>
     public event Action<LockRelease>? Released;
     public bool IsActive => _active;
+
+    /// <summary>
+    /// Vrai seulement quand l'écran est réellement pris en otage.
+    ///
+    /// Distinct d'IsActive, et la distinction est le cœur de la V1.4 : en mode souple
+    /// le verrou est actif mais l'ordinateur reste utilisable. Ce sont les appelants
+    /// qui empêchent d'ouvrir la fenêtre principale ou la replient qui doivent
+    /// consulter celui-ci — sinon le mode souple interdirait justement l'usage qu'il
+    /// est censé préserver.
+    /// </summary>
+    public bool IsBlocking => _active && _activeMode == LockMode.Hard;
 
     public LockController(JournalDb db, Settings settings)
     {
@@ -80,6 +102,15 @@ public sealed class LockController : IDisposable
         _snoozeWatch = new DispatcherTimer();
         _snoozeWatch.Tick += (_, _) => SnoozeExpired();
 
+        // Escalade de l'encart, mesurée depuis la DERNIÈRE apparition et non depuis la
+        // première : chaque réapparition remet le compteur à zéro. Conséquence assumée,
+        // un snooze toutes les quinze minutes maintient l'encart au premier palier
+        // indéfiniment. C'est cohérent avec le reste — ce qui escalade, c'est d'ignorer,
+        // et snoozer est un accusé de réception, pas une faute. Les lignes
+        // Log.Write("snooze", …) diront si ce trou est exploité.
+        _escalate = new DispatcherTimer { Interval = EscalateAfter };
+        _escalate.Tick += (_, _) => { _escalate.Stop(); _soft?.Escalate(); };
+
         // Un snooze survit au redémarrage : il vit en base, pas en mémoire. Sans ce
         // réarmement, quitter puis relancer Bujo pendant un snooze le rendrait éternel
         // jusqu'à la bascule du jour — un contournement gratuit et involontaire.
@@ -92,6 +123,9 @@ public sealed class LockController : IDisposable
         Environment.GetEnvironmentVariable("BUJO_NOLOCK") == "1"
         || File.Exists(Path.Combine(Path.GetDirectoryName(JournalDb.DefaultPath)!, "NOLOCK"));
 
+    /// <summary>Délai avant le second palier de l'encart, mesuré depuis son apparition.</summary>
+    private static readonly TimeSpan EscalateAfter = TimeSpan.FromMinutes(20);
+
     public bool ShouldLock(DateOnly day) =>
         !KillSwitchEngaged && !_db.IsSnoozed(day) && _db.HasRoutine(day) && !_db.IsRoutineDone(day);
 
@@ -102,9 +136,33 @@ public sealed class LockController : IDisposable
         _snoozePending = false;
         _snoozeWatch.Stop();
         _day = LogicalDay.Today();
+        _activeMode = _settings.LockMode;   // figé pour toute la durée de cet engagement
         _db.EnsureDay(_day);
         _db.LogLockEvent(_day, "shown");
 
+        if (_activeMode == LockMode.Soft) EngageSoft();
+        else EngageHard();
+    }
+
+    /// <summary>
+    /// Encart non bloquant. Aucune fenêtre de couverture, aucune remise au premier
+    /// plan : _reassert n'est même pas démarré, c'est ce qui distingue les deux modes
+    /// bien plus que l'apparence.
+    /// </summary>
+    private void EngageSoft()
+    {
+        _soft = new SoftLockWindow(
+            _db, _day, _settings.SnoozeMinutes,
+            onSnooze: Snooze,
+            onComplete: () => Release(LockRelease.Completed));
+        _soft.Show();
+
+        _escalate.Stop();
+        _escalate.Start();
+    }
+
+    private void EngageHard()
+    {
         var primary = Forms.Screen.PrimaryScreen;
         foreach (var screen in Forms.Screen.AllScreens)
         {
@@ -128,6 +186,10 @@ public sealed class LockController : IDisposable
         if (!_active) return;
         _active = false;
         _reassert.Stop();
+        _escalate.Stop();
+
+        _soft?.AllowCloseAndClose();
+        _soft = null;
 
         foreach (var w in _windows) w.AllowCloseAndClose();
         _windows.Clear();
@@ -227,5 +289,6 @@ public sealed class LockController : IDisposable
         _reassert.Stop();
         _dayWatch.Stop();
         _snoozeWatch.Stop();
+        _escalate.Stop();
     }
 }

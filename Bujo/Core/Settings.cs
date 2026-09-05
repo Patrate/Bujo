@@ -5,6 +5,13 @@ namespace Bujo.Core;
 public enum CloseAction { Quit, MinimizeToTray }
 
 /// <summary>
+/// Comment la routine se rappelle au matin.
+///   Hard : verrou plein écran, l'ordinateur est pris en otage
+///   Soft : encart en bas à droite, dérangeant mais l'ordinateur reste utilisable
+/// </summary>
+public enum LockMode { Hard, Soft }
+
+/// <summary>
 /// Réglages de cet appareil. Stockés dans local_state, donc volontairement HORS
 /// du périmètre de synchro : l'heure de verrouillage ou le démarrage automatique
 /// n'ont pas à être les mêmes sur le portable et sur le fixe.
@@ -22,6 +29,40 @@ public sealed class Settings(JournalDb db)
             db.SetLocal("settings.cutoff_hour", value.ToString());
             LogicalDay.Cutoff = TimeSpan.FromHours(value);
         }
+    }
+
+    /// <summary>
+    /// Mode de verrouillage de CET appareil. Comme le reste des réglages, il vit dans
+    /// local_state et reste hors du périmètre de synchro : bloquant sur le fixe et
+    /// souple sur le portable est un usage prévu, pas un accident.
+    ///
+    /// Défaut **souple** depuis la V1.5, et c'est un changement assumé : le défaut
+    /// valait « bloquant » pour ne rien modifier aux bases antérieures à la V1.4. Une
+    /// base qui n'a jamais touché ce réglage bascule donc en souple à la mise à jour.
+    /// Le motif l'emporte : sur une installation neuve il n'y a rien à préserver, et se
+    /// faire enfermer le jour même n'est pas un accueil. Une seule vérité, ici, plutôt
+    /// qu'un défaut de propriété et un défaut d'assistant qui se contrediraient.
+    /// </summary>
+    public LockMode LockMode
+    {
+        get => db.GetLocal("settings.lock_mode") == "hard" ? LockMode.Hard : LockMode.Soft;
+        set => db.SetLocal("settings.lock_mode", value == LockMode.Hard ? "hard" : "soft");
+    }
+
+    /// <summary>
+    /// La présentation a déjà été montrée. Une clé EXPLICITE, et non l'absence
+    /// d'habitudes : depuis que le semis n'existe plus, une base sans habitude est un
+    /// état parfaitement normal — on peut légitimement toutes les archiver — et le
+    /// déduire rouvrirait l'assistant à chaque démarrage.
+    ///
+    /// Posé dès que l'assistant s'ouvre, pas à sa dernière page. Le fermer en cours de
+    /// route vaut « vu » : reproposer une fenêtre qu'on vient d'écarter est agaçant, et
+    /// le bouton « Revoir la présentation » des Paramètres sert de rattrapage.
+    /// </summary>
+    public bool SetupDone
+    {
+        get => db.GetLocal("setup.done") == "1";
+        set => db.SetLocal("setup.done", value ? "1" : "0");
     }
 
     /// <summary>
